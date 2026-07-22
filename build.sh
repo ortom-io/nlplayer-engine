@@ -93,6 +93,8 @@ esac
 # ------------------------------------------------------------------------------
 # Environment Directory Setup
 # ------------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 BUILD_DIR="$(pwd)/android_build"
 INSTALL_DIR="$(pwd)/ffmpeg"
 FINAL_PACKAGE_DIR="${BUILD_DIR}/android_static_binaries"
@@ -263,20 +265,19 @@ git clone --depth 1 --branch "$FFMPEG_BRANCH" "$FFMPEG_REPO" ffmpeg
 # ==============================================================================
 # SOURCE PATCHING: TINYPLAY INJECTION
 # ==============================================================================
-# Preserving the invoking script's directory for local asset resolution
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 cd "${BUILD_DIR}/tinyalsa" || err "Failed to enter tinyalsa directory"
 TINYPLAY_SRC="utils/tinyplay.c"
 
 # Resolving tinyplay.c source (Local dev override vs Remote production fetch)
 if [ -f "$SCRIPT_DIR/tinyplay.c" ]; then
-    info "[LOCAL DEV] Deploying local source override: $SCRIPT_DIR/tinyplay.c"
+    info "Deploying local source override: $SCRIPT_DIR/tinyplay.c"
     cp "$SCRIPT_DIR/tinyplay.c" "$TINYPLAY_SRC"
+    TINYPLAY_SOURCE_ORIGIN="LOCAL"
 else
     RAW_GITHUB_URL="https://raw.githubusercontent.com/ortom-io/nlplayer-engine/main/tinyplay.c?nocache=$(date +%s)"
-    info "[REMOTE] Fetching upstream tinyplay.c..."
+    info "Fetching upstream tinyplay.c..."
     curl -sSL "$RAW_GITHUB_URL" -o "$TINYPLAY_SRC"
+    TINYPLAY_SOURCE_ORIGIN="GITHUB"
 fi
 
 [ -s "$TINYPLAY_SRC" ] || err "tinyplay.c payload is missing or empty."
@@ -615,5 +616,12 @@ cd "$FINAL_PACKAGE_DIR/bin" || err "Failed to enter final package directory"
 cd - >/dev/null
 
 echo ""
+
+if [ "$TINYPLAY_SOURCE_ORIGIN" = "LOCAL" ]; then
+    printf "[${Y}SOURCE${R}] tinyplay payload : ${Y}● LOCAL DEV OVERRIDE${R} (%s/tinyplay.c)\n" "$SCRIPT_DIR"
+else
+    printf "[${C}SOURCE${R}] tinyplay payload : ${C}○ GITHUB ${R}\n"
+fi
+
 ok "TOOLCHAIN EXECUTION COMPLETE."
 ok "Final deployment archive established: ${TARGET_ARCHIVE}"
