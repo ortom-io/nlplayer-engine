@@ -27,13 +27,17 @@ The **Android NDK** is required for cross-compilation.
 * **Note:** You do not need to configure any custom paths or environment variables. The build script features a heuristic discovery engine that will automatically locate the NDK on your system.
 
 ### 2. System Dependencies
-You will need standard development tools, autotools, and 7-Zip.
+You will need standard C/C++ build tools, GNU autotools, and 7-Zip.
 
-**For Arch Linux:**
+**Arch Linux:**
 ```bash
-sudo pacman -S base-devel git autoconf automake libtool p7zip curl wget
+sudo pacman -S --needed base-devel git autoconf automake libtool p7zip curl wget
 ```
-*(For Debian/Ubuntu, use `sudo apt install build-essential git autoconf automake libtool p7zip-full curl wget`)*
+
+**Ubuntu & Debian:**
+```bash
+sudo apt update && sudo apt install -y build-essential git autoconf automake libtool p7zip-full curl wget
+```
 
 ---
 
@@ -71,4 +75,3 @@ This project is **dual-licensed**:
 For commercial licensing inquiries:
 - **Email:** `ortom.dev@proton.me`
 - **Telegram:** `@ortom_io`
-- 
