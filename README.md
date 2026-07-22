@@ -1,19 +1,24 @@
 # nlplayer-engine
 
-A highly optimized, real-time audio playback engine for Android, built specifically for bit-perfect output via USB DACs. 
+A highly optimized audio playback engine for Android, built specifically to achieve the **highest possible audio output quality** and bit-perfect fidelity via USB DACs.
 
-This project provides a custom audio player (`tinyplay`) and a complete cross-compilation environment. It compiles fully static binaries (TinyALSA + FFmpeg) heavily optimized for ARM64 (Cortex-A78) using advanced instruction sets, thread isolation, and kernel-bypass techniques to achieve zero-latency playback.
+This project provides a custom audio player (`tinyplay`) and an automated cross-compilation environment. It compiles fully static binaries (ALSA-lib + FFmpeg) heavily optimized for ARM64 (Cortex-A78) using advanced instruction sets, thread isolation, and kernel-level optimizations to eliminate system jitter and deliver uncompromised audio performance on Android smartphones.
 
-## 🚀 Technical Highlights
-
-* **Direct Audio Output:** Bypasses the Android system audio mixer, communicating directly with USB DACs via ALSA.
-* **CPU Core Isolation:** Utilizes `cgroups` to isolate dedicated CPU cores exclusively for real-time audio processing.
-* **Lock-Free Architecture:** Implements Shared Memory (SHM) and `eventfd` for zero-syscall, non-blocking playback control.
-* **Fully Static Binaries:** ALSA-lib, FFmpeg, and TinyALSA are linked statically, ensuring zero dependencies on the Android host OS libraries.
+> ⚠️ **Requirement on Target Device:** Running `nlplayer-engine` on an Android device **requires Root access**. The engine directly manipulates kernel parameters (`/sys`, `/proc`), CPU `cgroups`, memory locking (`mlockall`), and hardware interfaces to guarantee maximum fidelity.
 
 ---
 
-## 🛠 Prerequisites
+## 🚀 Technical Highlights
+
+* **Maximum Audio Fidelity:** Bypasses Android's `AudioFlinger` and software resamplers completely, delivering pure, bit-perfect digital audio directly to external USB DACs.
+* **Full ALSA-lib Backend:** Integrates full `alsa-lib` (`libasound`), allowing native control over hardware sample rates, bit depths, and buffer alignment.
+* **System Jitter & Stutter Elimination:** Uses Linux `cgroups` for strict CPU core isolation and real-time process scheduling (`SCHED_FIFO`) to prevent background Android processes from interfering with audio streaming.
+* **Lock-Free Architecture:** Implements Shared Memory (SHM) and `eventfd` IPC for zero-syscall, non-blocking playback control.
+* **Fully Static Binaries:** Built as standalone static binaries with no external dependencies on Android host OS libraries.
+
+---
+
+## 🛠 Prerequisites for Building
 
 ### 1. Android NDK
 The **Android NDK** is required for cross-compilation. 
@@ -28,7 +33,7 @@ You will need standard development tools, autotools, and 7-Zip.
 ```bash
 sudo pacman -S base-devel git autoconf automake libtool p7zip curl wget
 ```
-*(For Debian/Ubuntu, use `apt install build-essential git autoconf automake libtool p7zip-full curl wget`)*
+*(For Debian/Ubuntu, use `sudo apt install build-essential git autoconf automake libtool p7zip-full curl wget`)*
 
 ---
 
@@ -43,7 +48,7 @@ chmod +x build.sh
 ./build.sh
 ```
 
-The script will automatically fetch the required source trees (ALSA-lib, TinyALSA, FFmpeg), inject the custom `tinyplay.c` engine, and perform a highly optimized static build.
+The script will automatically fetch the required source trees (ALSA-lib, FFmpeg, and the base player sources), inject the custom playback engine, and perform a highly optimized static build.
 
 ### 📦 Build Artifacts
 
@@ -66,3 +71,4 @@ This project is **dual-licensed**:
 For commercial licensing inquiries:
 - **Email:** `ortom.dev@proton.me`
 - **Telegram:** `@ortom_io`
+- 
