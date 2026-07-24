@@ -217,7 +217,7 @@ struct ctx {
     size_t map_size;
     uint8_t *data_start;
     size_t data_size;
-    size_t play_offset;
+    size_t play_offset; 
     struct chunk_fmt fmt;
     uint16_t valid_bits_per_sample;
     bool is_float_ext;
@@ -1878,8 +1878,9 @@ shm_watcher_thread(void *arg)
 
         /* Direct kernel bypass for real-time timer synchronization */
         if (new_cmd == CMD_UPDATE_TIME) {
+            size_t base_frames = atomic_load_explicit(&wargs->ctx->sync_base_frames, memory_order_acquire);
             snd_pcm_sframes_t delay_frames = 0;
-            
+
             if (wargs->ctx->alsa_fd >= 0) {
                 if (ioctl(wargs->ctx->alsa_fd, SNDRV_PCM_IOCTL_DELAY, &delay_frames) < 0) {
                     delay_frames = 0;
@@ -1893,7 +1894,6 @@ shm_watcher_thread(void *arg)
             }
 
             /* Lock-free acoustic position calculation */
-            size_t base_frames = atomic_load_explicit(&wargs->ctx->sync_base_frames, memory_order_acquire);
             long acoustic = (long)base_frames - delay_frames;
             if (acoustic < 0)
                 acoustic = 0;
@@ -1941,8 +1941,7 @@ memory_warmer_thread(void *arg)
             if (available_size > ctx->map_size)
                 available_size = ctx->map_size;
             
-            /* 1. Page-in the newly decoded file chunks first.
-               All page faults are processed on this low-priority thread. */
+            /* Pre-fault memory to isolate I/O latency (page faults) from RT thread */
             if (warmed_offset < available_size) {
                 /* Asynchronously ask the kernel to prepare the ENTIRE chunk at once.
                    One syscall instead of thousands to prevent VMA lock contention. */
@@ -1956,8 +1955,7 @@ memory_warmer_thread(void *arg)
                 }
             }
             
-            /* 2. Publish the verified and pre-warmed file size to the RT thread.
-               Using memory_order_release guarantees memory consistency across cores. */
+            /* Publish safe readable boundary to RT thread */
             atomic_store_explicit(&ctx->live_file_size, available_size, memory_order_release);
             
             /* Clean exit: background decoding is complete and all pages are locked in RAM */
@@ -1969,9 +1967,7 @@ memory_warmer_thread(void *arg)
             break;
         }
         
-        /* Extremely responsive hardware polling.
-           Sleep 2ms to prevent CPU saturation on standard cores while 
-           keeping the isolated ALSA RT-thread fully fed. */
+        /* 2ms tick: balance CPU load vs RT thread starvation */
         usleep(2000); 
     }
     return NULL;
@@ -2187,7 +2183,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         
         ctx->play_offset = target_bytes;
         update_sync_base(ctx, cmd, 0);
-        
+
         if (shm) {
             atomic_store_explicit(&shm->current_frame, target_bytes / frame_bytes, memory_order_release);
         }
@@ -2293,9 +2289,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             
             atomic_store_explicit(&signal_event, 0, memory_order_release);
             
-            /* Drain eventfd to prevent spurious poll() wakeups in the future.
-               Since cmd_efd is non-blocking, this instantly clears the counter. 
-               Called only when a command actually occurs, preserving Zero-Syscall path! */
+            /* Flush non-blocking eventfd to prevent spurious poll() wakeups */
             uint64_t dump;
             while (read(cmd_efd, &dump, sizeof(dump)) > 0);
             
@@ -2716,14 +2710,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         atomic_store_explicit(&shm->state, STATE_PLAYING, memory_order_release);
                     }
 
-                    /* Update time purely in User-Space (Zero-Syscall).
-                       Subtract hardware buffer size to approximate acoustic time. */
+                    /* Approximate acoustic time in userspace (lock-free) */
                     long hw_buffer_frames = cmd->period_size * cmd->period_count;
                     size_t total_real_frames = ctx->play_offset / frame_bytes;
                     long acoustic = (long)total_real_frames - hw_buffer_frames;
 
                     if (acoustic < 0) acoustic = 0;
-                    
+
                     atomic_store_explicit(&shm->current_frame, acoustic, memory_order_relaxed);
                 }
             } else {
@@ -2995,23 +2988,47 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         }
 
         case SM_DRAINING: {
-            /* State: SM_DRAINING */
+            /* State: SM_DRAINING 
+               Two-phase lock-free drain:
+               1. Write 'silence_frames_needed' to push the audio into the DAC.
+               2. Wait non-blockingly until the DAC consumes all real audio.
+            */
+            long hw_delay = get_safe_alsa_delay(ctx, 0);
+
             if (silence_frames_written >= silence_frames_needed) {
-                track_completed = true; /* Real audio has left the speakers */
-                break;
+                /* Phase 2: Wait for DMA flush. hw_delay <= silence means real audio reached DAC */
+                long target_delay = (long)silence_frames_written - 64;
+                if (target_delay < 0) target_delay = 0;
+
+                /* 64-frame silence margin to stabilize DAC voltage (anti-pop) */
+                if (hw_delay <= target_delay || hw_delay <= 0) {
+                    track_completed = true;
+                    break;
+                }
+                
+                /* Yield CPU via eventfd. Avoid POLLOUT busy-looping on partially empty buffer */
+                struct pollfd pfd = { .fd = cmd_efd, .events = POLLIN, .revents = 0 };
+                poll(&pfd, 1, 2); /* 2ms tick - keeps RT thread alive but cool */
+                
+                if (pfd.revents & POLLIN) {
+                    uint64_t dump;
+                    while (read(cmd_efd, &dump, sizeof(dump)) > 0);
+                    /* Command will be evaluated on the next loop iteration */
+                }
+                
+                goto update_drain_timer;
             }
             
             size_t chunk_f = cmd->period_size;
             
-            /* Do not write more silence than the remaining audio in the DAC */
+            /* Phase 1: Write pre-allocated silence to flush the buffer */
             if (silence_frames_written + chunk_f > silence_frames_needed) {
                 chunk_f = silence_frames_needed - silence_frames_written;
             }
             
             if (chunk_f > 0) {
-                /* Write pre-allocated silence to flush the buffer */
                 int w = ALSA_WRITE(ctx->pcm, silence_buf, chunk_f);
-                
+
                 if (w < 0) {
                     int cmd_now = atomic_load_explicit(&shm->command, memory_order_acquire);
                     if (cmd_now == CMD_PAUSE || cmd_now == CMD_SEEK || atomic_load_explicit(&signal_event, memory_order_acquire)) {
@@ -3021,13 +3038,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     if (w == -EAGAIN) { 
                         if (wait_for_alsa_or_command(ctx, cmd_efd, timeout_ms))
                             break;
-                        continue; 
+                        goto update_drain_timer; 
                     }
 
                     if (w == -EINTR)
                         break;
                     
-                    /* Final exit condition */
+                    /* Final exit condition: DAC starved, all audio has 100% played */
                     if (w == -EPIPE) { 
                         track_completed = true; 
                         break; 
@@ -3036,24 +3053,25 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     is_hw_error = true;
                     atomic_store(&stop_flag, 1);
                     break;
-                } else {
+                } else if (w > 0) {
                     silence_frames_written += w;
                     update_sync_base(ctx, cmd, silence_frames_written);
                 }
             }
             
+        update_drain_timer:
             /* Timer synchronization */
-            /* Smooth UI timer updates during drain */
+            /* Smooth lock-free UI timer updates during drain */
             if (shm) {
-                long hw_delay = get_safe_alsa_delay(ctx, 0);
+                long delay_sync = get_safe_alsa_delay(ctx, 0);
 
                 size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
                 size_t total_real_frames = ctx->play_offset / frame_bytes;
 
                 /* Calculate frames emitted from the speakers */
-                long frames_emitted = (total_real_frames + silence_frames_written) - hw_delay;
+                long frames_emitted = (total_real_frames + silence_frames_written) - delay_sync;
                 
-                /* Restrict timer to valid acoustic frames */
+                /* Restrict timer to valid acoustic frames, stripping trailing silence */
                 long acoustic = frames_emitted;
                 if (acoustic > total_real_frames)
                     acoustic = total_real_frames;
@@ -3097,7 +3115,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     
     /* Wake up watcher thread to prevent deadlocks */
     atomic_store_explicit(&shm->command, CMD_EXIT, memory_order_release);
-    sys_futex((int*)&shm->command, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+    sys_futex((int *)&shm->command, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
     
     pthread_join(watcher_tid, NULL);
     if (cmd->expected_size > 0) {
