@@ -2711,10 +2711,10 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         atomic_store_explicit(&shm->state, STATE_PLAYING, memory_order_release);
                     }
 
-                    /* Approximate acoustic time in userspace (lock-free) */
-                    long hw_buffer_frames = cmd->period_size * cmd->period_count;
+                    /* Approximate acoustic time in userspace */
+                    long delay_frames = get_safe_alsa_delay(ctx, cmd);
                     size_t total_real_frames = ctx->play_offset / frame_bytes;
-                    long acoustic = (long)total_real_frames - hw_buffer_frames;
+                    long acoustic = (long)total_real_frames - delay_frames;
 
                     if (acoustic < 0) acoustic = 0;
 
