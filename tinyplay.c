@@ -1889,8 +1889,10 @@ shm_watcher_thread(void *arg)
 
             /* Filter invalid hardware reports */
             long max_hw_buffer = wargs->cmd->period_size * wargs->cmd->period_count;
-            if (delay_frames < 0 || (max_hw_buffer > 0 && delay_frames > max_hw_buffer)) {
+            if (delay_frames < 0) {
                 delay_frames = 0;
+            } else if (max_hw_buffer > 0 && delay_frames > max_hw_buffer) {
+                delay_frames = max_hw_buffer; 
             }
 
             /* Lock-free acoustic position calculation */
@@ -2072,9 +2074,9 @@ get_available_bytes(struct ctx *ctx, struct cmd *cmd, size_t offset)
 
 /* Safely queries the ALSA hardware delay in frames via direct kernel bypass. */
 static long
-get_safe_alsa_delay(struct ctx *ctx, long max_hw_buffer)
+get_safe_alsa_delay(struct ctx *ctx, struct cmd *cmd)
 {
-    if (!ctx || ctx->alsa_fd < 0)
+    if (!ctx || ctx->alsa_fd < 0 || !cmd)
         return 0;
 
     snd_pcm_sframes_t delay_sf = 0;
@@ -2086,8 +2088,9 @@ get_safe_alsa_delay(struct ctx *ctx, long max_hw_buffer)
         return 0;
 
     /* Filter out invalid delays from buggy ALSA drivers */
+    long max_hw_buffer = cmd->period_size * cmd->period_count;
     if (max_hw_buffer > 0 && delay_frames > max_hw_buffer)
-        return 0;
+        return max_hw_buffer;
 
     return delay_frames;
 }
@@ -2301,7 +2304,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         /* Temporarily switch to blocking mode to ensure writes */
                         snd_pcm_nonblock(ctx->pcm, 0);
 
-                        long delay_frames = get_safe_alsa_delay(ctx, 0);
+                        long delay_frames = get_safe_alsa_delay(ctx, cmd);
 
                         long safety_margin = 1024; 
                         size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
@@ -2347,7 +2350,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                             if (atomic_load_explicit(&signal_event, memory_order_acquire))
                                 break;
 
-                            long d_frames = get_safe_alsa_delay(ctx, 0);
+                            long d_frames = get_safe_alsa_delay(ctx, cmd);
                             if (d_frames <= 0)
                                 break;
 
@@ -2403,7 +2406,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         }
 
                         if (ctx->pcm) {
-                            long delay_frames = get_safe_alsa_delay(ctx, 0);
+                            long delay_frames = get_safe_alsa_delay(ctx, cmd);
                             long safety_margin = 1024;
                             bool rewound = false;
 
@@ -2559,8 +2562,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 /* Handle EOF or expected file end */
                 if (is_ffmpeg_done > 0 || ctx->play_offset >= ctx->data_size) {
                     /* Transition to DRAINING */
-                    long max_hw_buffer = cmd->period_size * cmd->period_count;
-                    long current_delay = get_safe_alsa_delay(ctx, max_hw_buffer);
+                    long current_delay = get_safe_alsa_delay(ctx, cmd);
 
                     /* Drain exactly the remaining samples. Provide a 64-sample (~1.5 ms) safety margin if the driver returns 0. */
                     if (current_delay <= 0) {
@@ -2621,8 +2623,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             /* Unified completion condition */
             if (!bytes_to_write) {
                 if (is_ffmpeg_done > 0) {
-                    long max_hw_buffer = cmd->period_size * cmd->period_count;
-                    long current_delay = get_safe_alsa_delay(ctx, max_hw_buffer);
+                    long current_delay = get_safe_alsa_delay(ctx, cmd);
                     
                     /* Drain exactly the number of samples needed to empty the DAC */
                     if (current_delay <= 0) {
@@ -2732,7 +2733,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             if (ctx->pcm) {
                 snd_pcm_nonblock(ctx->pcm, 0);
 
-                long delay_frames = get_safe_alsa_delay(ctx, 0);
+                long delay_frames = get_safe_alsa_delay(ctx, cmd);
 
                 long safety_margin = 1024;
                 size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
@@ -2776,7 +2777,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         break;
                     }
 
-                    long d_frames = get_safe_alsa_delay(ctx, 0);
+                    long d_frames = get_safe_alsa_delay(ctx, cmd);
                     if (d_frames <= 0)
                         break; 
 
@@ -2794,7 +2795,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     usleep(2000); 
                 }
 
-                long final_delay = get_safe_alsa_delay(ctx, 0);
+                long final_delay = get_safe_alsa_delay(ctx, cmd);
                 long final_acoustic = total_written_frames - final_delay;
                 
                 /* Clamp to prevent skipping audio during resume */
@@ -2993,7 +2994,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                1. Write 'silence_frames_needed' to push the audio into the DAC.
                2. Wait non-blockingly until the DAC consumes all real audio.
             */
-            long hw_delay = get_safe_alsa_delay(ctx, 0);
+            long hw_delay = get_safe_alsa_delay(ctx, cmd);
 
             if (silence_frames_written >= silence_frames_needed) {
                 /* Phase 2: Wait for DMA flush. hw_delay <= silence means real audio reached DAC */
@@ -3063,7 +3064,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             /* Timer synchronization */
             /* Smooth lock-free UI timer updates during drain */
             if (shm) {
-                long delay_sync = get_safe_alsa_delay(ctx, 0);
+                long delay_sync = get_safe_alsa_delay(ctx, cmd);
 
                 size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
                 size_t total_real_frames = ctx->play_offset / frame_bytes;
