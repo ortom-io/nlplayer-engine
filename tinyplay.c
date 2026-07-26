@@ -217,7 +217,10 @@ struct ctx {
     size_t map_size;
     uint8_t *data_start;
     size_t data_size;
-    size_t play_offset; 
+    size_t play_offset;
+    size_t continuous_frames;
+    bool is_cruising;
+    long cruise_delay; 
     struct chunk_fmt fmt;
     uint16_t valid_bits_per_sample;
     bool is_float_ext;
@@ -2283,6 +2286,10 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         }
     }
 
+    ctx->is_cruising = false;
+    ctx->continuous_frames = 0;
+    ctx->cruise_delay = 0;
+
     /* Main state machine loop */
     while (!atomic_load(&stop_flag) && !track_completed) {
 
@@ -2515,6 +2522,10 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                             }
                             
                             atomic_store_explicit(&shm->current_frame, target_frame, memory_order_release);
+                            
+                            ctx->is_cruising = false;
+                            ctx->continuous_frames = 0;
+                            ctx->cruise_delay = 0;
                             sm_state = SM_PLAYING;
                         } else {
                             /* Device is paused */
@@ -2674,6 +2685,10 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         break;
                     }
                     
+                    ctx->is_cruising = false;
+                    ctx->continuous_frames = 0;
+                    ctx->cruise_delay = 0;
+                    
                     /* XRUN recovery: apply software fade-in to prevent secondary pops */
                     size_t fade_frames = optimal_fade_frames; 
                     if (fade_frames > bytes_to_write / frame_bytes) {
@@ -2711,12 +2726,29 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         atomic_store_explicit(&shm->state, STATE_PLAYING, memory_order_release);
                     }
 
-                    /* Approximate acoustic time in userspace */
-                    long delay_frames = get_safe_alsa_delay(ctx, cmd);
                     size_t total_real_frames = ctx->play_offset / frame_bytes;
-                    long acoustic = (long)total_real_frames - delay_frames;
+                    long acoustic;
 
-                    if (acoustic < 0) acoustic = 0;
+                    /* Calculate acoustic position */
+                    if (unlikely(!ctx->is_cruising)) {
+                        /* Ramp-up phase: precise hardware delay polling */
+                        long delay_frames = get_safe_alsa_delay(ctx, cmd);
+                        ctx->continuous_frames += written_frames;
+                        
+                        /* Lock cruise delay once buffer is physically full */
+                        if (ctx->continuous_frames >= total_buffer_frames && delay_frames > 0) {
+                            ctx->is_cruising = true;
+                            ctx->cruise_delay = delay_frames;
+                        }
+                        
+                        acoustic = (long)total_real_frames - delay_frames;
+                    } else {
+                        /* Cruise phase: zero-syscall lock-free projection */
+                        acoustic = (long)total_real_frames - ctx->cruise_delay;
+                    }
+
+                    if (acoustic < 0)
+                        acoustic = 0;
 
                     atomic_store_explicit(&shm->current_frame, acoustic, memory_order_relaxed);
                 }
@@ -2964,10 +2996,14 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 ctx->play_offset += audio_bytes;
                 update_sync_base(ctx, cmd, 0);
                 
+                ctx->is_cruising = false;
+                ctx->continuous_frames = 0;
+                ctx->cruise_delay = 0;
+                
                 /* STATE_PLAYING will be set by SM_PLAYING on the first physical byte */
                 sm_state = SM_PLAYING;
             } else {
-                if (ctx->pcm) { 
+                if (ctx->pcm) {
                     snd_pcm_close(ctx->pcm); 
                     ctx->pcm = NULL; 
                 }
