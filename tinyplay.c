@@ -1984,64 +1984,111 @@ apply_fade(uint8_t *buffer, size_t frames, struct cmd *cmd, bool is_fade_in)
 {
     if (!buffer || frames == 0)
         return;
+
     int phys_width = snd_pcm_format_physical_width(cmd->format);
 
     if (cmd->format == SND_PCM_FORMAT_FLOAT_LE) {
         float *samples = (float *)buffer;
+        
+        /* FPU optimization: multiply by inverse to avoid division in the loop */
+        const float inv_frames = 1.0f / (float)frames;
+        
         for (size_t i = 0; i < frames; i++) {
-            float vol = (float)i / (float)frames;
-            if (!is_fade_in) vol = 1.0f - vol;
-            vol *= vol;
+            float vol = (float)i * inv_frames;
+            if (!is_fade_in)
+                vol = 1.0f - vol;
+            
+            float vol_sq = vol * vol;
             for (unsigned int c = 0; c < cmd->channels; c++)
-                samples[i * cmd->channels + c] *= vol;
+                samples[i * cmd->channels + c] *= vol_sq;
         }
     } else if (cmd->format == SND_PCM_FORMAT_FLOAT64_LE) {
         double *samples = (double *)buffer;
+        const double inv_frames = 1.0 / (double)frames;
+        
         for (size_t i = 0; i < frames; i++) {
-            double vol = (double)i / (double)frames;
-            if (!is_fade_in) vol = 1.0 - vol;
-            vol *= vol;
+            double vol = (double)i * inv_frames;
+            if (!is_fade_in)
+                vol = 1.0 - vol;
+            
+            double vol_sq = vol * vol;
             for (unsigned int c = 0; c < cmd->channels; c++)
-                samples[i * cmd->channels + c] *= vol;
+                samples[i * cmd->channels + c] *= vol_sq;
         }
-    } else if (phys_width == 16) {
-        int16_t *samples = (int16_t *)buffer;
-        for (size_t i = 0; i < frames; i++) {
-            uint32_t base_vol = (uint32_t)(((uint64_t)i << 16) / frames);
-            uint32_t vol = is_fade_in ? base_vol : 65536 - base_vol;
-            uint32_t vol_sq = (uint32_t)(((uint64_t)vol * vol) >> 16);
-            for (unsigned int c = 0; c < cmd->channels; c++) 
-                samples[i * cmd->channels + c] = (int16_t)(((samples[i * cmd->channels + c] * (int32_t)vol_sq) + 32768) >> 16);
-        }
-    } else if (phys_width == 32) {
-        int32_t *samples = (int32_t *)buffer;
-        for (size_t i = 0; i < frames; i++) {
-            uint32_t base_vol = (uint32_t)(((uint64_t)i << 16) / frames);
-            uint32_t vol = is_fade_in ? base_vol : 65536 - base_vol;
-            uint32_t vol_sq = (uint32_t)(((uint64_t)vol * vol) >> 16);
-            for (unsigned int c = 0; c < cmd->channels; c++) 
-                samples[i * cmd->channels + c] = (int32_t)((((int64_t)samples[i * cmd->channels + c] * vol_sq) + 32768) >> 16);
-        }
-    } else if (phys_width == 24) {
-        uint8_t *samples = (uint8_t *)buffer;
-        for (size_t i = 0; i < frames; i++) {
-            uint32_t base_vol = (uint32_t)(((uint64_t)i << 16) / frames);
-            uint32_t vol = is_fade_in ? base_vol : 65536 - base_vol;
-            uint32_t vol_sq = (uint32_t)(((uint64_t)vol * vol) >> 16);
-            for (unsigned int c = 0; c < cmd->channels; c++) {
-                uint8_t *p = samples + (i * cmd->channels + c) * 3;
+    } else {
+        /* 32.32 fixed-point accumulator to bypass 64-bit division per sample */
+        uint64_t vol_step = (1ULL << 32) / frames;
+        uint64_t vol_accum = 0;
+
+        if (phys_width == 16) {
+            int16_t *samples = (int16_t *)buffer;
+            for (size_t i = 0; i < frames; i++) {
+                uint32_t base_vol = vol_accum >> 16;
+                vol_accum += vol_step;
                 
-                int32_t val = p[0] | (p[1] << 8) | (p[2] << 16);
+                uint32_t vol = is_fade_in ? base_vol : 65536 - base_vol;
+                uint32_t vol_sq = (uint32_t)(((uint64_t)vol * vol) >> 16);
                 
-                if (val & 0x00800000) {
-                    val |= 0xFF000000;
+                for (unsigned int c = 0; c < cmd->channels; c++) {
+                    samples[i * cmd->channels + c] = 
+                        (int16_t)(((samples[i * cmd->channels + c] * (int32_t)vol_sq) + 32768) >> 16);
                 }
+            }
+        } else if (cmd->format == SND_PCM_FORMAT_S32_LE) {
+            int32_t *samples = (int32_t *)buffer;
+            for (size_t i = 0; i < frames; i++) {
+                uint32_t base_vol = vol_accum >> 16;
+                vol_accum += vol_step;
+                
+                uint32_t vol = is_fade_in ? base_vol : 65536 - base_vol;
+                uint32_t vol_sq = (uint32_t)(((uint64_t)vol * vol) >> 16);
+                
+                for (unsigned int c = 0; c < cmd->channels; c++) {
+                    samples[i * cmd->channels + c] = 
+                        (int32_t)((((int64_t)samples[i * cmd->channels + c] * vol_sq) + 32768) >> 16);
+                }
+            }
+        } else if (cmd->format == SND_PCM_FORMAT_S24_LE) {
+            int32_t *samples = (int32_t *)buffer;
+            for (size_t i = 0; i < frames; i++) {
+                uint32_t base_vol = vol_accum >> 16;
+                vol_accum += vol_step;
+                
+                uint32_t vol = is_fade_in ? base_vol : 65536 - base_vol;
+                uint32_t vol_sq = (uint32_t)(((uint64_t)vol * vol) >> 16);
+                
+                for (unsigned int c = 0; c < cmd->channels; c++) {
+                    /* Strip garbage padding, then apply branchless sign extension */
+                    int32_t raw_val = samples[i * cmd->channels + c] & 0x00FFFFFF;
+                    int32_t val = (raw_val ^ 0x800000) - 0x800000;
+                    
+                    val = (int32_t)((((int64_t)val * vol_sq) + 32768) >> 16);
+                    
+                    /* Mask MSB to prevent DAC noise */
+                    samples[i * cmd->channels + c] = val & 0x00FFFFFF;
+                }
+            }
+        } else if (phys_width == 24) {
+            uint8_t *samples = (uint8_t *)buffer;
+            for (size_t i = 0; i < frames; i++) {
+                uint32_t base_vol = vol_accum >> 16;
+                vol_accum += vol_step;
+                
+                uint32_t vol = is_fade_in ? base_vol : 65536 - base_vol;
+                uint32_t vol_sq = (uint32_t)(((uint64_t)vol * vol) >> 16);
+                
+                for (unsigned int c = 0; c < cmd->channels; c++) {
+                    uint8_t *p = samples + (i * cmd->channels + c) * 3;
+                    int32_t raw_val = p[0] | (p[1] << 8) | (p[2] << 16);
+                    
+                    /* Branchless sign extension */
+                    int32_t val = (raw_val ^ 0x800000) - 0x800000;
+                    val = (int32_t)((((int64_t)val * vol_sq) + 32768) >> 16);
 
-                val = (int32_t)((((int64_t)val * vol_sq) + 32768) >> 16);
-
-                p[0] = val & 0xFF;
-                p[1] = (val >> 8) & 0xFF;
-                p[2] = (val >> 16) & 0xFF;
+                    p[0] = val & 0xFF;
+                    p[1] = (val >> 8) & 0xFF;
+                    p[2] = (val >> 16) & 0xFF;
+                }
             }
         }
     }
