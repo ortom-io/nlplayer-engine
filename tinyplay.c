@@ -27,7 +27,6 @@
 ** DAMAGE.
 */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -61,6 +60,7 @@
 #include <sys/inotify.h>
 #include <limits.h>
 #include <stdalign.h>
+#include "shm_protocol.h"
 
 
 /* Wrapper for direct system call */
@@ -163,27 +163,6 @@ typedef struct {
 static state_entry_t g_state_cache[MAX_STATE_ENTRIES];
 static int g_state_count = 0;
 
-/* SHM Structure */
-struct player_ctrl {
-    atomic_uint_least32_t magic;              /* 0 */
-    atomic_int_least32_t  command;            /* 4 */
-    atomic_uint_least32_t seek_target;        /* 8 */
-    atomic_uint_least32_t total_frames;       /* 12 */
-    atomic_uint_least32_t current_frame;      /* 16 */
-    atomic_int_least32_t  state;              /* 20 */
-    atomic_uint_least32_t sample_rate;        /* 24 */
-    atomic_uint_least32_t channels;           /* 28 */
-    atomic_uint_least32_t bits;               /* 32 */
-    atomic_uint_least32_t exact_total_frames; /* 36 */
-    atomic_uint_least32_t hw_period_size;     /* 40 */
-    atomic_uint_least32_t hw_buffer_size;     /* 44 */
-    atomic_int_least32_t  hw_format;          /* 48 */
-    atomic_int_least32_t  hw_access;          /* 52 */
-    uint8_t _padding[64 - (14 * sizeof(atomic_uint_least32_t))]; /* Remainder: 8 bytes */
-} __attribute__((aligned(64)));
-
-_Static_assert(sizeof(struct player_ctrl) == 64, "player_ctrl structure size violation! Check padding.");
-
 static struct player_ctrl *shm = NULL;
 volatile atomic_int signal_event = 0;
 static volatile atomic_int stop_flag = 0;
@@ -228,6 +207,7 @@ struct ctx {
     /* --- RT THREAD DATA --- */
     /* Written exclusively by the isolated audio core */
     alignas(64) atomic_size_t sync_base_frames;
+    _Atomic(bool) wake_pending; // EventFD Userspace Optimizer
     
     /* --- BACKGROUND THREADS DATA --- */
     /* Written exclusively by the warmer_thread on standard cores */
@@ -1474,6 +1454,7 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
     memset(ctx, 0, sizeof(struct ctx)); 
     ctx->fd = -1; 
     ctx->map_start = MAP_FAILED;
+    atomic_init(&ctx->wake_pending, false);
 
     if (map_file(ctx, cmd) != 0) {
         return -1;
@@ -1783,7 +1764,7 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
 }
 
 void
-init_shm(uint32_t total_frames, struct cmd *cmd)
+init_shm(uint64_t total_frames, struct cmd *cmd)
 {
     const char *shm_path = cmd ? cmd->shm_file : g_shm_path;
     int fd = open(shm_path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
@@ -1809,8 +1790,12 @@ init_shm(uint32_t total_frames, struct cmd *cmd)
         if (current_magic != 0xDEADBEEF) {
             /* Fresh memory, initialize completely */
             atomic_init(&shm->command, CMD_NONE);
+            atomic_init(&shm->futex_waiters, 0); 
             atomic_init(&shm->state, STATE_PAUSED);
             atomic_init(&shm->total_frames, total_frames);
+            atomic_init(&shm->current_frame, 0);
+            atomic_init(&shm->exact_total_frames, 0);
+            
             if (cmd) {
                 atomic_init(&shm->sample_rate, cmd->rate);
                 atomic_init(&shm->channels, cmd->channels);
@@ -1824,6 +1809,9 @@ init_shm(uint32_t total_frames, struct cmd *cmd)
             /* Memory already initialized, update playback state */
             atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
             atomic_store_explicit(&shm->total_frames, total_frames, memory_order_release);
+            atomic_store_explicit(&shm->current_frame, 0, memory_order_release);
+            atomic_store_explicit(&shm->exact_total_frames, 0, memory_order_release);
+            
             if (cmd) {
                 atomic_store_explicit(&shm->sample_rate, cmd->rate, memory_order_release);
                 atomic_store_explicit(&shm->channels, cmd->channels, memory_order_release);
@@ -1867,20 +1855,29 @@ shm_watcher_thread(void *arg)
     setpriority(PRIO_PROCESS, 0, 19);
 
     struct watcher_args *wargs = (struct watcher_args *)arg;
-    pthread_t main_tid = wargs->main_tid;
-    struct ctx *ctx = wargs->ctx;
     
     while (!atomic_load(&stop_flag)) {
-        int current_cmd = atomic_load_explicit(&shm->command, memory_order_acquire);
+        int current_cmd;
         
-        sys_futex((int *)&shm->command, FUTEX_WAIT, current_cmd, NULL, NULL, 0);
+        while ((current_cmd = atomic_load_explicit(&shm->command, memory_order_acquire)) == CMD_NONE && 
+               !atomic_load(&stop_flag)) {
+            
+            /* Smart Futex: Notify JNI we are sleeping (Strict seq_cst barrier) */
+            atomic_fetch_add_explicit(&shm->futex_waiters, 1, memory_order_seq_cst);
+            
+            if (atomic_load_explicit(&shm->command, memory_order_seq_cst) == CMD_NONE) {
+                sys_futex((int *)&shm->command, FUTEX_WAIT, CMD_NONE, NULL, NULL, 0);
+            }
+            
+            /* Woken up: Remove sleeping flag */
+            atomic_fetch_sub_explicit(&shm->futex_waiters, 1, memory_order_seq_cst);
+        }
         
         if (atomic_load(&stop_flag))
             break;
-        int new_cmd = atomic_load_explicit(&shm->command, memory_order_acquire);
 
         /* Direct kernel bypass for real-time timer synchronization */
-        if (new_cmd == CMD_UPDATE_TIME) {
+        if (current_cmd == CMD_UPDATE_TIME) {
             size_t base_frames = atomic_load_explicit(&wargs->ctx->sync_base_frames, memory_order_acquire);
             snd_pcm_sframes_t delay_frames = 0;
 
@@ -1890,32 +1887,29 @@ shm_watcher_thread(void *arg)
                 }
             }
 
-            /* Filter invalid hardware reports */
             long max_hw_buffer = wargs->cmd->period_size * wargs->cmd->period_count;
-            if (delay_frames < 0) {
-                delay_frames = 0;
-            } else if (max_hw_buffer > 0 && delay_frames > max_hw_buffer) {
-                delay_frames = max_hw_buffer; 
-            }
+            if (delay_frames < 0) delay_frames = 0;
+            else if (max_hw_buffer > 0 && delay_frames > max_hw_buffer) delay_frames = max_hw_buffer; 
 
-            /* Lock-free acoustic position calculation */
             long acoustic = (long)base_frames - delay_frames;
-            if (acoustic < 0)
-                acoustic = 0;
+            if (acoustic < 0) acoustic = 0;
 
-            atomic_store_explicit(&shm->current_frame, acoustic, memory_order_relaxed);
+            atomic_store_explicit(&shm->current_frame, (uint64_t)acoustic, memory_order_relaxed);
             
+            /* Complete command. NO FUTEX_WAKE NEEDED (JNI uses Spin-Wait) */
             int expected_cmd = CMD_UPDATE_TIME;
             atomic_compare_exchange_strong_explicit(&shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
-            sys_futex((int *)&shm->command, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
-            
             continue;
         }
 
-        if (new_cmd == CMD_PAUSE || new_cmd == CMD_SEEK || new_cmd == CMD_EXIT || new_cmd == CMD_RESUME) {
-            uint64_t val = 1;
-            /* Asynchronous zero-signal wakeup for the RT thread's poll() */
-            write(wargs->cmd_efd, &val, sizeof(val)); 
+        if (current_cmd == CMD_PAUSE || current_cmd == CMD_SEEK || current_cmd == CMD_EXIT || current_cmd == CMD_RESUME) {
+            /* Zero-syscall EventFD optimization */
+            bool expected = false;
+            if (atomic_compare_exchange_strong_explicit(&wargs->ctx->wake_pending, &expected, true, memory_order_acq_rel, memory_order_relaxed)) {
+                uint64_t val = 1;
+                /* Asynchronous zero-signal wakeup for the RT thread's poll() */
+                write(wargs->cmd_efd, &val, sizeof(val)); 
+            }
         }
     }
     return NULL;
@@ -2172,8 +2166,14 @@ wait_for_alsa_or_command(struct ctx *ctx, int cmd_efd, int timeout_ms)
 
     /* Interrupted by watcher thread */
     if (pfds[1].revents & POLLIN) {
-        uint64_t dummy;
-        read(cmd_efd, &dummy, sizeof(dummy));
+        uint64_t dump;
+        bool read_happened = false;
+        while (read(cmd_efd, &dump, sizeof(dump)) > 0) {
+            read_happened = true;
+        }
+        if (read_happened) {
+            atomic_store_explicit(&ctx->wake_pending, false, memory_order_release);
+        }
         return true;
     }
 
@@ -2348,7 +2348,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             
             /* Flush non-blocking eventfd to prevent spurious poll() wakeups */
             uint64_t dump;
-            while (read(cmd_efd, &dump, sizeof(dump)) > 0);
+            bool read_happened = false;
+            while (read(cmd_efd, &dump, sizeof(dump)) > 0) {
+                read_happened = true;
+            }
+            if (read_happened) {
+                atomic_store_explicit(&ctx->wake_pending, false, memory_order_release);
+            }
             
             if (shm) {
                 int c = atomic_load_explicit(&shm->command, memory_order_acquire);
@@ -2447,8 +2453,8 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     if (atomic_compare_exchange_strong_explicit(&shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed)) {
                         
                         /* Read target strictly after successful command acquisition */
-                        uint32_t target_frame = atomic_load_explicit(&shm->seek_target, memory_order_acquire);
-                        uint32_t total_frames = atomic_load_explicit(&shm->total_frames, memory_order_acquire);
+                        uint64_t target_frame = atomic_load_explicit(&shm->seek_target, memory_order_acquire);
+                        uint64_t total_frames = atomic_load_explicit(&shm->total_frames, memory_order_acquire);
 
                         /* Handle seek to EOF or beyond */
                         if (target_frame >= total_frames) {
@@ -2608,7 +2614,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             }
 
             /* Read the EOF flag once for the entire state */
-            uint32_t is_ffmpeg_done = 0;
+            uint64_t is_ffmpeg_done = 0;
             if (shm)
                 is_ffmpeg_done = atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire);
 
@@ -2926,7 +2932,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                spurious poll() triggers in subsequent states. */
             if (pfd.revents & POLLIN) {
                 uint64_t dump;
-                while (read(cmd_efd, &dump, sizeof(dump)) > 0);
+                bool read_happened = false;
+                while (read(cmd_efd, &dump, sizeof(dump)) > 0) {
+                    read_happened = true;
+                }
+                if (read_happened) {
+                    atomic_store_explicit(&ctx->wake_pending, false, memory_order_release);
+                }
             }
             break;
         }
@@ -3062,7 +3074,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 /* Drain eventfd if we were woken by a command rather than a timeout */
                 if (pfd.revents & POLLIN) {
                     uint64_t dump;
-                    while (read(cmd_efd, &dump, sizeof(dump)) > 0);
+                    bool read_happened = false;
+                    while (read(cmd_efd, &dump, sizeof(dump)) > 0) {
+                        read_happened = true;
+                    }
+                    if (read_happened) {
+                        atomic_store_explicit(&ctx->wake_pending, false, memory_order_release);
+                    }
                 }
                 
                 if (atomic_load(&stop_flag))
@@ -3096,7 +3114,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 
                 if (pfd.revents & POLLIN) {
                     uint64_t dump;
-                    while (read(cmd_efd, &dump, sizeof(dump)) > 0);
+                    bool read_happened = false;
+                    while (read(cmd_efd, &dump, sizeof(dump)) > 0) {
+                        read_happened = true;
+                    }
+                    if (read_happened) {
+                        atomic_store_explicit(&ctx->wake_pending, false, memory_order_release);
+                    }
                     /* Command will be evaluated on the next loop iteration */
                 }
                 
@@ -3376,6 +3400,8 @@ main(int argc, char **argv)
         case 'h':
             print_usage(argv[0]);
             return 0;
+        default:
+            break;
         }
     }
 

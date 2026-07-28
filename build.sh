@@ -168,7 +168,7 @@ GLOBAL_DEEP_OPTS="-fno-common -fmerge-all-constants -fno-threadsafe-statics \
 -mllvm --enable-gvn-memdep \
 -mllvm --twoaddr-reschedule"
 
-export COMMON_CFLAGS_BASE="-fomit-frame-pointer -fno-semantic-interposition -ffunction-sections -fdata-sections --sysroot=${SYSROOT} -DNDEBUG -fno-unwind-tables -fno-asynchronous-unwind-tables -fPIC -fPIE -fno-stack-protector -fstrict-aliasing -fno-exceptions -fno-rtti -fno-plt -fno-sanitize=all ${TARGET_FEATURES} ${GLOBAL_DEEP_OPTS}"
+export COMMON_CFLAGS_BASE="-std=gnu11 -D_GNU_SOURCE -fomit-frame-pointer -fno-semantic-interposition -ffunction-sections -fdata-sections --sysroot=${SYSROOT} -DNDEBUG -fno-unwind-tables -fno-asynchronous-unwind-tables -fPIC -fPIE -fno-stack-protector -fstrict-aliasing -fno-exceptions -fno-rtti -fno-plt -fno-sanitize=all ${TARGET_FEATURES} ${GLOBAL_DEEP_OPTS}"
 
 export COMMON_LDFLAGS_BASE="-Wl,-O3 -Wl,--gc-sections --sysroot=${SYSROOT} -Wl,--sort-section=alignment -Wl,-z,noseparate-code -Wl,--optimize-bb-jumps"
 
@@ -267,8 +267,10 @@ git clone --depth 1 --branch "$FFMPEG_BRANCH" "$FFMPEG_REPO" ffmpeg
 # ==============================================================================
 cd "${BUILD_DIR}/tinyalsa" || err "Failed to enter tinyalsa directory"
 TINYPLAY_SRC="utils/tinyplay.c"
+SHM_HEADER_SRC="utils/shm_protocol.h"
+PROJECT_CPP_HEADER="$HOME/NLPlayer/app/src/main/cpp/shm_protocol.h"
 
-# Resolving tinyplay.c source (Local dev override vs Remote production fetch)
+# 1. Resolving tinyplay.c
 if [ -f "$SCRIPT_DIR/tinyplay.c" ]; then
     info "Deploying local source override: $SCRIPT_DIR/tinyplay.c"
     cp "$SCRIPT_DIR/tinyplay.c" "$TINYPLAY_SRC"
@@ -281,7 +283,23 @@ else
 fi
 
 [ -s "$TINYPLAY_SRC" ] || err "tinyplay.c payload is missing or empty."
-ok "tinyplay.c source tree integration successful."
+ok "tinyplay.c integration successful."
+
+# 2. Resolving shm_protocol.h for build tree only
+if [ -f "$SCRIPT_DIR/shm_protocol.h" ]; then
+    info "Deploying local header override: $SCRIPT_DIR/shm_protocol.h"
+    cp "$SCRIPT_DIR/shm_protocol.h" "$SHM_HEADER_SRC"
+elif [ -f "$PROJECT_CPP_HEADER" ]; then
+    info "Deploying header from Android C++ tree: $PROJECT_CPP_HEADER"
+    cp "$PROJECT_CPP_HEADER" "$SHM_HEADER_SRC"
+else
+    RAW_HEADER_URL="https://raw.githubusercontent.com/ortom-io/nlplayer-engine/main/shm_protocol.h?nocache=$(date +%s)"
+    info "Fetching upstream shm_protocol.h..."
+    curl -sSL "$RAW_HEADER_URL" -o "$SHM_HEADER_SRC"
+fi
+
+[ -s "$SHM_HEADER_SRC" ] || err "shm_protocol.h payload is missing or empty."
+ok "shm_protocol.h integration successful."
 
 cd "$BUILD_DIR"
 # ==============================================================================
@@ -586,6 +604,14 @@ if [ -f "$ASSETS_ARCHIVE" ]; then
     TARGET_ARCHIVE="$ASSETS_ARCHIVE"
     info "Target mapped to application assets. Overwriting existing payload."
     
+    # --- ATOMIC SYNC: C++ JNI HEADER ---
+    TARGET_CPP_DIR="${PROJECT_SOURCE_DIR}/cpp"
+    COMPILED_SHM_HEADER="${BUILD_DIR}/tinyalsa/utils/shm_protocol.h"
+    if [ -d "$TARGET_CPP_DIR" ] && [ -f "$COMPILED_SHM_HEADER" ]; then
+        cp "$COMPILED_SHM_HEADER" "${TARGET_CPP_DIR}/shm_protocol.h"
+        ok "C++ JNI header atomically updated: ${TARGET_CPP_DIR}/shm_protocol.h"
+    fi
+
     if [ -f "$KOTLIN_INSTALLER" ]; then
         CURRENT_VERSION=$(grep -oP 'private const val BINARY_VERSION = \K[0-9]+' "$KOTLIN_INSTALLER")
         
