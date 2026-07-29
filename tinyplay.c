@@ -196,7 +196,12 @@ struct ctx {
     size_t map_size;
     uint8_t *data_start;
     size_t data_size;
-    size_t play_offset;
+
+    /* --- CONSTANTS & HOT STATE --- */
+    size_t frame_bytes;
+    size_t data_frames;
+    size_t play_frames;
+    
     size_t continuous_frames;
     bool is_cruising;
     long cruise_delay; 
@@ -211,7 +216,7 @@ struct ctx {
     
     /* --- BACKGROUND THREADS DATA --- */
     /* Written exclusively by the warmer_thread on standard cores */
-    alignas(64) atomic_size_t live_file_size;
+    alignas(64) atomic_size_t live_file_frames;
 };
 
 struct cmd {
@@ -1372,7 +1377,6 @@ parse_wav_headers(struct ctx *ctx)
                 ctx->data_size = chunk_size;
             }
             
-            ctx->play_offset = 0;
             found_data = true;
         }
         
@@ -1414,7 +1418,7 @@ map_file(struct ctx *ctx, struct cmd *cmd)
         return -1;
     }
     
-    atomic_init(&ctx->live_file_size, sb.st_size);
+    /* live_file_frames initialized later in ctx_init */
 
     if (cmd->expected_size > 0) {
         /* Map to expected_size for live streaming. Pages will be mapped upon write. */
@@ -1463,7 +1467,6 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
     if (cmd->filetype && strcmp(cmd->filetype, "raw") == 0) {
         ctx->data_start = ctx->map_start;
         ctx->data_size = (cmd->expected_size > 0) ? cmd->expected_size : ctx->map_size;
-        ctx->play_offset = 0;
         
         if (cmd->bits == 32) {
             cmd->format = SND_PCM_FORMAT_S32_LE;
@@ -1760,6 +1763,20 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
         fprintf(stderr, "Warning: PCM is not direct HW. IOCTL bypass disabled.\n");
     }
 
+    /* --- PRECALCULATE RT CONSTANTS --- */
+    ctx->frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
+    ctx->data_frames = (ctx->data_size > 0 && ctx->frame_bytes > 0) ? (ctx->data_size / ctx->frame_bytes) : 0;
+    ctx->play_frames = 0;
+
+    struct stat sb;
+    if (fstat(ctx->fd, &sb) == 0) {
+        size_t header_size = ctx->data_start - ctx->map_start;
+        size_t initial_payload = (sb.st_size > header_size) ? (sb.st_size - header_size) : 0;
+        atomic_init(&ctx->live_file_frames, initial_payload / ctx->frame_bytes);
+    } else {
+        atomic_init(&ctx->live_file_frames, 0);
+    }
+
     return 0;
 }
 
@@ -1929,6 +1946,7 @@ memory_warmer_thread(void *arg)
     struct ctx *ctx = (struct ctx *)arg;
     const size_t page_size = sysconf(_SC_PAGESIZE);
     size_t warmed_offset = 0;
+    size_t header_size = ctx->data_start - ctx->map_start;
     
     while (!atomic_load(&stop_flag)) {
         bool is_ffmpeg_done = (shm && atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire) > 0);
@@ -1954,8 +1972,10 @@ memory_warmer_thread(void *arg)
                 }
             }
             
-            /* Publish safe readable boundary to RT thread */
-            atomic_store_explicit(&ctx->live_file_size, available_size, memory_order_release);
+            /* Calculate frames in background and publish safe readable boundary */
+            size_t payload_bytes = (available_size > header_size) ? (available_size - header_size) : 0;
+            size_t available_frames = payload_bytes / ctx->frame_bytes;
+            atomic_store_explicit(&ctx->live_file_frames, available_frames, memory_order_release);
             
             /* Clean exit: background decoding is complete and all pages are locked in RAM */
             if (is_ffmpeg_done && warmed_offset >= available_size) {
@@ -2088,34 +2108,6 @@ apply_fade(uint8_t *buffer, size_t frames, struct cmd *cmd, bool is_fade_in)
     }
 }
 
-/* Returns the exact number of bytes physically available in mapped memory */
-static size_t
-get_available_bytes(struct ctx *ctx, struct cmd *cmd, size_t offset)
-{
-    size_t header_size = ctx->data_start - ctx->map_start;
-    size_t absolute_offset = header_size + offset;
-
-    /* Telemetry Optimization: read atomic size published by background prefetcher.
-       For static files (expected_size == 0), this is initialized to final file size.
-       For live files, warmer_thread securely updates this value.
-       RT thread never leaves Userspace! No VFS locks! */
-    size_t live_size = atomic_load_explicit(&ctx->live_file_size, memory_order_acquire);
-    
-    if (live_size > absolute_offset) {
-        size_t available = live_size - absolute_offset;
-        
-        /* Optional constraint for perfectly valid WAV headers */
-        if (ctx->data_size > 0 && available > (ctx->data_size - offset)) {
-            available = ctx->data_size - offset;
-        }
-        return available;
-    }
-    
-    /* If prefetcher hasn't warmed enough data, we return 0. 
-       play_sample() will safely wait (usleep) without making blocking syscalls. */
-    return 0;
-}
-
 /* Safely queries the ALSA hardware delay in frames via direct kernel bypass. */
 static long
 get_safe_alsa_delay(struct ctx *ctx, struct cmd *cmd)
@@ -2186,11 +2178,9 @@ wait_for_alsa_or_command(struct ctx *ctx, int cmd_efd, int timeout_ms)
 
 /* Lock-free helper to sync time base with UI */
 static inline void
-update_sync_base(struct ctx *ctx, struct cmd *cmd, size_t silence_frames)
+update_sync_base(struct ctx *ctx, size_t silence_frames)
 {
-    size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
-    size_t total_real_frames = ctx->play_offset / frame_bytes;
-    atomic_store_explicit(&ctx->sync_base_frames, total_real_frames + silence_frames, memory_order_release);
+    atomic_store_explicit(&ctx->sync_base_frames, ctx->play_frames + silence_frames, memory_order_release);
 }
 
 /* --- PLAYBACK LOOP (CHILD) --- */
@@ -2219,26 +2209,23 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         chunk_frames = total_buffer_frames / 2; 
     }
 
-    size_t chunk_bytes = snd_pcm_frames_to_bytes(ctx->pcm, chunk_frames);
-    size_t period_bytes = snd_pcm_frames_to_bytes(ctx->pcm, cmd->period_size);
-
-    init_shm(snd_pcm_bytes_to_frames(ctx->pcm, ctx->data_size), cmd);
+    init_shm(ctx->data_frames, cmd);
 
     /* Initial seek logic for settings reload */
     if (cmd->initial_seek > 0) {
-        size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
-        size_t target_bytes = (size_t)cmd->initial_seek * frame_bytes;
+        size_t target_frames = (size_t)cmd->initial_seek;
+        size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
         
-        size_t avail = get_available_bytes(ctx, cmd, 0);
-        if (target_bytes > avail)
-            target_bytes = avail;
-        target_bytes -= (target_bytes % frame_bytes);
-        
-        ctx->play_offset = target_bytes;
-        update_sync_base(ctx, cmd, 0);
+        if (target_frames > live_frames)
+            target_frames = live_frames;
+        if (ctx->data_frames > 0 && target_frames > ctx->data_frames)
+            target_frames = ctx->data_frames;
+            
+        ctx->play_frames = target_frames;
+        update_sync_base(ctx, 0);
 
         if (shm) {
-            atomic_store_explicit(&shm->current_frame, target_bytes / frame_bytes, memory_order_release);
+            atomic_store_explicit(&shm->current_frame, target_frames, memory_order_release);
         }
     }
 
@@ -2265,7 +2252,6 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     int timeout_ms = ((cmd->period_size * 1000) + cmd->rate - 1) / cmd->rate + 20;
     
     player_sm_state_t sm_state = SM_PLAYING;
-    struct timespec retry_interval; 
     bool is_hw_error = false; 
     bool track_completed = false; 
 
@@ -2273,7 +2259,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     size_t silence_frames_written = 0;
 
     /* Preallocate silence buffer */
-    size_t max_period_bytes = snd_pcm_frames_to_bytes(ctx->pcm, cmd->period_size);
+    size_t max_period_bytes = cmd->period_size * ctx->frame_bytes;
     void *silence_buf = NULL;
     if (posix_memalign(&silence_buf, 64, max_period_bytes) != 0) {
         fprintf(stderr, "Fatal: Failed to allocate aligned silence buffer\n");
@@ -2292,13 +2278,12 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         optimal_fade_frames = 64;
 
     /* Preallocate buffer for realtime fades */
-    size_t rt_frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
     size_t max_rt_frames = optimal_fade_frames * 2; 
     if (cmd->period_size * 2 > max_rt_frames) {
         max_rt_frames = cmd->period_size * 2;
     }
     uint8_t *rt_fade_buf = NULL;
-    if (posix_memalign((void **)&rt_fade_buf, 64, max_rt_frames * rt_frame_bytes) != 0) {
+    if (posix_memalign((void **)&rt_fade_buf, 64, max_rt_frames * ctx->frame_bytes) != 0) {
         fprintf(stderr, "Fatal: Failed to allocate aligned RT fade buffer\n");
         free(silence_buf);
         return 1;
@@ -2306,7 +2291,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
 
     /* Lock allocated memory pages */
     mlock(silence_buf, max_period_bytes);
-    mlock(rt_fade_buf, max_rt_frames * rt_frame_bytes);
+    mlock(rt_fade_buf, max_rt_frames * ctx->frame_bytes);
 
     snd_pcm_format_set_silence(cmd->format, silence_buf, cmd->period_size * cmd->channels);
     snd_pcm_format_set_silence(cmd->format, rt_fade_buf, max_rt_frames * cmd->channels);
@@ -2365,32 +2350,29 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         snd_pcm_nonblock(ctx->pcm, 0);
 
                         long delay_frames = get_safe_alsa_delay(ctx, cmd);
-
                         long safety_margin = 1024; 
-                        size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
-                        
-                        long remaining_unfaded_frames = delay_frames;
-                        size_t read_offset = ctx->play_offset;
+                        size_t read_frames = ctx->play_frames;
 
                         if (delay_frames > safety_margin) {
                             unsigned long rewind_amount = delay_frames - safety_margin;
                             snd_pcm_sframes_t actually_rewound = snd_pcm_rewind(ctx->pcm, rewind_amount);
                             
                             if (actually_rewound > 0) {
-                                remaining_unfaded_frames = delay_frames - actually_rewound;
-                                size_t actual_rewind_bytes = actually_rewound * frame_bytes;
-                                read_offset = (ctx->play_offset >= actual_rewind_bytes) ? 
-                                              (ctx->play_offset - actual_rewind_bytes) : 0;
+                                read_frames = (ctx->play_frames >= (size_t)actually_rewound) ? 
+                                              (ctx->play_frames - actually_rewound) : 0;
                             }
                         }
 
                         size_t fade_frames = optimal_fade_frames;
-                        size_t fade_bytes = fade_frames * frame_bytes;
+                        size_t fade_bytes = fade_frames * ctx->frame_bytes;
 
                         /* Apply fade-out */
-                        size_t avail = get_available_bytes(ctx, cmd, read_offset);
-                        if (avail >= fade_bytes) {
-                            memcpy(rt_fade_buf, ctx->data_start + read_offset, fade_bytes);
+                        size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
+                        size_t avail_frames = (live_frames > read_frames) ? (live_frames - read_frames) : 0;
+                        
+                        if (avail_frames >= fade_frames) {
+                            uint8_t *data_ptr = ctx->data_start + (read_frames * ctx->frame_bytes);
+                            memcpy(rt_fade_buf, data_ptr, fade_bytes);
                             apply_fade(rt_fade_buf, fade_frames, cmd, false);
                         } else {
                             memset(rt_fade_buf, 0, fade_bytes);
@@ -2402,9 +2384,10 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         snd_pcm_format_set_silence(cmd->format, rt_fade_buf, silence_frames * cmd->channels);
                         ALSA_WRITE(ctx->pcm, rt_fade_buf, silence_frames);
 
-                        /* Exit timing synchronization */
-                        long total_written_frames = (read_offset / frame_bytes) + fade_frames + silence_frames;
-                        long max_real_acoustic = (read_offset / frame_bytes) + fade_frames;
+                        /* Exit timing synchronization: Wait for audio + fade to physically play,
+                           but ignore the trailing hardware silence to prevent timer drift in UI. */
+                        long total_written_frames = read_frames + fade_frames + silence_frames;
+                        long max_real_acoustic = read_frames + fade_frames;
 
                         while (!atomic_load(&stop_flag)) {
                             if (atomic_load_explicit(&signal_event, memory_order_acquire))
@@ -2416,7 +2399,8 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
 
                             long acoustic = total_written_frames - d_frames;
                             
-                            /* Clamp silence to prevent timer drift */
+                            /* Clamp to max_real_acoustic so the UI timer stops exactly 
+                               at the end of the fade-out, not after the silence padding. */
                             if (acoustic > max_real_acoustic)
                                 acoustic = max_real_acoustic;
                             if (acoustic < 0)
@@ -2433,8 +2417,6 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     atomic_store(&stop_flag, 1);
                     break;
                 } else if (c == CMD_PAUSE) {
-                    /* Transition to pausing if not already sleeping or pausing */
-                    /* If RESUMING, state change to PAUSING will occur on the next iteration */
                     if (sm_state != SM_SLEEPING && sm_state != SM_PAUSING) {
                         sm_state = SM_PAUSING;
                     }
@@ -2449,19 +2431,17 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 } else if (c == CMD_SEEK) {
                     int expected_cmd = CMD_SEEK;
                     
-                    /* Exclusively acquire command via CAS. Concurrent modifications will be caught on the next iteration. */
+                    /* Exclusively acquire command via CAS */
                     if (atomic_compare_exchange_strong_explicit(&shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed)) {
                         
-                        /* Read target strictly after successful command acquisition */
                         uint64_t target_frame = atomic_load_explicit(&shm->seek_target, memory_order_acquire);
                         uint64_t total_frames = atomic_load_explicit(&shm->total_frames, memory_order_acquire);
 
-                        /* Handle seek to EOF or beyond */
                         if (target_frame >= total_frames) {
                             if (ctx->pcm) {
                                 snd_pcm_drop(ctx->pcm); 
                             }
-                            track_completed = true; /* Exit immediately */
+                            track_completed = true; 
                             break; 
                         }
 
@@ -2470,16 +2450,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                             long safety_margin = 1024;
                             bool rewound = false;
 
-                            /* Calculate position for normal seek */
-                            size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
-                            size_t target_bytes = (size_t)target_frame * frame_bytes;
+                            size_t target_frames = target_frame;
+                            size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
+                            if (target_frames > live_frames)
+                                target_frames = live_frames;
 
-                            size_t real_data_size = get_available_bytes(ctx, cmd, 0);
-                            if (target_bytes > real_data_size)
-                                target_bytes = real_data_size;
-                            target_bytes = (target_bytes / frame_bytes) * frame_bytes;
-
-                            /* Fast rewind path */
+                            /* Fast rewind path: Seamless seek without dropping PCM.
+                               Overwrites the upcoming DMA buffer data on the fly. */
                             if (delay_frames > safety_margin) {
                                 unsigned long rewind_amount = delay_frames - safety_margin;
                                 snd_pcm_sframes_t actually_rewound = snd_pcm_rewind(ctx->pcm, rewind_amount);
@@ -2487,35 +2464,39 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                                 if (actually_rewound > 0) {
                                     rewound = true;
                                     size_t fade_frames = optimal_fade_frames;
-                                    size_t fade_bytes = fade_frames * frame_bytes;
+                                    size_t fade_bytes = fade_frames * ctx->frame_bytes;
                                     
-                                    size_t actual_rewind_bytes = actually_rewound * frame_bytes;
-                                    size_t old_tail_offset = (ctx->play_offset >= actual_rewind_bytes) ? (ctx->play_offset - actual_rewind_bytes) : 0;
-
-                                    size_t avail_old = get_available_bytes(ctx, cmd, old_tail_offset);
-                                    if (avail_old >= fade_bytes) {
-                                        memcpy(rt_fade_buf, ctx->data_start + old_tail_offset, fade_bytes);
+                                    /* 1. Crossfade out the old audio tail to prevent clicking */
+                                    size_t old_tail_frames = (ctx->play_frames >= (size_t)actually_rewound) ? (ctx->play_frames - actually_rewound) : 0;
+                                    size_t avail_old = (live_frames > old_tail_frames) ? (live_frames - old_tail_frames) : 0;
+                                    
+                                    if (avail_old >= fade_frames) {
+                                        uint8_t *data_ptr = ctx->data_start + (old_tail_frames * ctx->frame_bytes);
+                                        memcpy(rt_fade_buf, data_ptr, fade_bytes);
                                         apply_fade(rt_fade_buf, fade_frames, cmd, false);
                                         ALSA_WRITE(ctx->pcm, rt_fade_buf, fade_frames); 
                                     }
 
-                                    size_t avail_new = get_available_bytes(ctx, cmd, target_bytes);
-                                    if (avail_new >= fade_bytes) {
-                                        memcpy(rt_fade_buf, ctx->data_start + target_bytes, fade_bytes);
+                                    /* 2. Crossfade in the new target audio */
+                                    size_t avail_new = (live_frames > target_frames) ? (live_frames - target_frames) : 0;
+                                    if (avail_new >= fade_frames) {
+                                        uint8_t *data_ptr = ctx->data_start + (target_frames * ctx->frame_bytes);
+                                        memcpy(rt_fade_buf, data_ptr, fade_bytes);
                                         apply_fade(rt_fade_buf, fade_frames, cmd, true);
                                         
                                         snd_pcm_sframes_t written = ALSA_WRITE(ctx->pcm, rt_fade_buf, fade_frames);
                                         long actual_written = (written > 0) ? written : 0;
-                                        ctx->play_offset = target_bytes + (actual_written * frame_bytes);
-                                        update_sync_base(ctx, cmd, 0);
+                                        ctx->play_frames = target_frames + actual_written;
+                                        update_sync_base(ctx, 0);
                                     } else {
-                                        ctx->play_offset = target_bytes;
-                                        update_sync_base(ctx, cmd, 0);
+                                        ctx->play_frames = target_frames;
+                                        update_sync_base(ctx, 0);
                                     }
                                 }
                             }
 
-                            /* Deep reset path */
+                            /* Deep reset path: PCM was stopped or empty.
+                               Requires full hardware re-initialization. */
                             if (!rewound) {
                                 snd_pcm_drop(ctx->pcm);
                                 snd_pcm_prepare(ctx->pcm);
@@ -2523,25 +2504,25 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                                 size_t period_frames = cmd->period_size;
                                 snd_pcm_format_set_silence(cmd->format, rt_fade_buf, period_frames * cmd->channels);
 
+                                /* Prepend hardware silence before real audio to stabilize 
+                                   DAC voltage and prevent amplifier pop noises. */
                                 size_t silence_frames = 512;
                                 if (silence_frames > period_frames)
                                     silence_frames = period_frames;
                                 size_t audio_frames = period_frames - silence_frames;
-                                size_t audio_bytes = audio_frames * frame_bytes;
 
-                                size_t avail_new = get_available_bytes(ctx, cmd, target_bytes);
-                                if (audio_bytes > avail_new) {
-                                    audio_bytes = avail_new;
-                                    audio_bytes -= (audio_bytes % frame_bytes);
-                                    audio_frames = audio_bytes / frame_bytes;
+                                size_t avail_new = (live_frames > target_frames) ? (live_frames - target_frames) : 0;
+                                if (audio_frames > avail_new) {
+                                    audio_frames = avail_new;
                                 }
 
-                                if (audio_bytes > 0) {
-                                    memcpy(rt_fade_buf + (silence_frames * frame_bytes), ctx->data_start + target_bytes, audio_bytes);
+                                if (audio_frames > 0) {
+                                    uint8_t *data_ptr = ctx->data_start + (target_frames * ctx->frame_bytes);
+                                    memcpy(rt_fade_buf + (silence_frames * ctx->frame_bytes), data_ptr, audio_frames * ctx->frame_bytes);
                                     size_t fi_frames = optimal_fade_frames;
                                     if (fi_frames > audio_frames)
                                         fi_frames = audio_frames;
-                                    apply_fade(rt_fade_buf + (silence_frames * frame_bytes), fi_frames, cmd, true);
+                                    apply_fade(rt_fade_buf + (silence_frames * ctx->frame_bytes), fi_frames, cmd, true);
                                 }
 
                                 snd_pcm_sframes_t written = 0;
@@ -2568,8 +2549,8 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                                         actual_written_audio = 0;
                                 }
 
-                                ctx->play_offset = target_bytes + (actual_written_audio * frame_bytes);
-                                update_sync_base(ctx, cmd, 0);
+                                ctx->play_frames = target_frames + actual_written_audio;
+                                update_sync_base(ctx, 0);
                                 silence_frames_needed = 0;
                                 silence_frames_written = 0;
                             }
@@ -2582,16 +2563,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                             sm_state = SM_PLAYING;
                         } else {
                             /* Device is paused */
-                            size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
-                            size_t target_bytes = (size_t)target_frame * frame_bytes;
+                            size_t target_frames = target_frame;
+                            size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
+                            if (target_frames > live_frames)
+                                target_frames = live_frames;
 
-                            size_t real_data_size = get_available_bytes(ctx, cmd, 0);
-                            if (target_bytes > real_data_size)
-                                target_bytes = real_data_size;
-                            target_bytes = (target_bytes / frame_bytes) * frame_bytes;
-
-                            ctx->play_offset = target_bytes;
-                            update_sync_base(ctx, cmd, 0);
+                            ctx->play_frames = target_frames;
+                            update_sync_base(ctx, 0);
                             atomic_store_explicit(&shm->current_frame, target_frame, memory_order_release);
                             
                             int expected_none = CMD_NONE;
@@ -2608,7 +2586,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         switch (sm_state) {
         case SM_PLAYING: {
             /* Safety check */
-            if (!ctx->pcm) {
+            if (unlikely(!ctx->pcm)) {
                 sm_state = SM_RESUMING;
                 break;
             }
@@ -2618,17 +2596,19 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             if (shm)
                 is_ffmpeg_done = atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire);
 
-            /* Determine available data from the current position */
-            size_t available = get_available_bytes(ctx, cmd, ctx->play_offset);
-            size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
+            /* Determine available frames (Lock-free, 0 divisions) */
+            size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
+            size_t available_frames = (live_frames > ctx->play_frames) ? (live_frames - ctx->play_frames) : 0;
 
-            if (!available) {
+            if (ctx->data_frames > 0 && available_frames > (ctx->data_frames - ctx->play_frames)) {
+                available_frames = ctx->data_frames - ctx->play_frames;
+            }
+
+            if (unlikely(!available_frames)) {
                 /* Handle EOF or expected file end */
-                if (is_ffmpeg_done > 0 || ctx->play_offset >= ctx->data_size) {
+                if (is_ffmpeg_done > 0 || (ctx->data_frames > 0 && ctx->play_frames >= ctx->data_frames)) {
                     /* Transition to DRAINING */
                     long current_delay = get_safe_alsa_delay(ctx, cmd);
-
-                    /* Drain exactly the remaining samples. Provide a 64-sample (~1.5 ms) safety margin if the driver returns 0. */
                     if (current_delay <= 0) {
                         current_delay = 64; 
                     }
@@ -2641,79 +2621,47 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     sm_state = SM_DRAINING;
                     continue;
                 } else {
-                    /* Wait for ffmpeg. 1ms sleep yields the core to the scheduler,
-                       preventing VRM noise (100% CPU busy-wait) and avoiding false 
-                       poll() wakes since ALSA is already starving (POLLOUT is true). */
+                    /* Wait for ffmpeg. 1ms sleep yields the core to the scheduler */
                     usleep(1000);
                     continue;
                 }
             }
 
             /* Calculate write chunk size */
-            size_t bytes_to_write = available;
-            if (bytes_to_write > chunk_bytes)
-                bytes_to_write = chunk_bytes;
-            /* Frame alignment */
-            bytes_to_write -= (bytes_to_write % frame_bytes);
+            size_t frames_to_write = available_frames;
+            if (frames_to_write > chunk_frames)
+                frames_to_write = chunk_frames;
 
-            void *data_ptr = ctx->data_start + ctx->play_offset;
-
+            uint8_t *data_ptr = ctx->data_start + (ctx->play_frames * ctx->frame_bytes);
             __builtin_prefetch(data_ptr, 0, 3);
 
             /* Handle incomplete periods */
-            if (bytes_to_write > 0 && bytes_to_write < chunk_bytes) {
+            if (unlikely(frames_to_write < chunk_frames)) {
                 if (is_ffmpeg_done > 0) {
                     /* EOF reached. Pad the final incomplete chunk with silence to safely flush it to ALSA. */
-                    size_t frames_valid = bytes_to_write / frame_bytes;
-                    size_t frames_missing = (chunk_bytes - bytes_to_write) / frame_bytes;
+                    size_t bytes_to_copy = frames_to_write * ctx->frame_bytes;
+                    size_t frames_missing = chunk_frames - frames_to_write;
                     
-                    /* Copy audio data to buffer */
-                    memcpy(rt_fade_buf, data_ptr, bytes_to_write);
-                    /* Fill the rest of the period with bit-perfect silence */
-                    snd_pcm_format_set_silence(cmd->format, rt_fade_buf + bytes_to_write, frames_missing * cmd->channels);
+                    memcpy(rt_fade_buf, data_ptr, bytes_to_copy);
+                    snd_pcm_format_set_silence(cmd->format, rt_fade_buf + bytes_to_copy, frames_missing * cmd->channels);
                     
                     data_ptr = rt_fade_buf;
-                    /* Send a full period to the hardware */
-                    bytes_to_write = chunk_bytes;
+                    frames_to_write = chunk_frames;
                 } else {
                     /* Stream is live, ffmpeg just hasn't delivered a full chunk yet.
-                       WE MUST NOT PAD! If we pad, we advance play_offset into empty space 
+                       WE MUST NOT PAD! If we pad, we advance play_frames into empty space 
                        and permanently delete upcoming audio data. Yield and wait for ffmpeg. */
                     usleep(1000);
                     continue;
                 }
             }
 
-            /* Unified completion condition */
-            if (!bytes_to_write) {
-                if (is_ffmpeg_done > 0) {
-                    long current_delay = get_safe_alsa_delay(ctx, cmd);
-                    
-                    /* Drain exactly the number of samples needed to empty the DAC */
-                    if (current_delay <= 0) {
-                        current_delay = 64; 
-                    }
-                    
-                    silence_frames_needed = current_delay;
-                    silence_frames_written = 0;
-                    if (shm)
-                        atomic_store_explicit(&shm->state, STATE_DRAINING, memory_order_release);
-                    
-                    sm_state = SM_DRAINING;
-                    continue;
-                } else {
-                    usleep(1000);
-                    continue;
-                }
-            }
+            __builtin_prefetch(data_ptr + (frames_to_write * ctx->frame_bytes), 0, 3);
 
-            /* Prefetch data */
-            __builtin_prefetch(data_ptr + bytes_to_write, 0, 3);
+            /* Write directly to ALSA in frames */
+            snd_pcm_sframes_t written_frames = ALSA_WRITE(ctx->pcm, data_ptr, frames_to_write);
 
-            /* Write to ALSA */
-            snd_pcm_sframes_t written_frames = ALSA_WRITE(ctx->pcm, data_ptr, bytes_to_write / frame_bytes);
-
-            if (written_frames < 0) {
+            if (unlikely(written_frames < 0)) {
                 /* Proactive command check: exit ALSA loop immediately if a signal is received */
                 int current_cmd = atomic_load_explicit(&shm->command, memory_order_acquire);
                 if (current_cmd == CMD_PAUSE || current_cmd == CMD_SEEK || current_cmd == CMD_EXIT ||
@@ -2742,36 +2690,34 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     ctx->continuous_frames = 0;
                     ctx->cruise_delay = 0;
                     
-                    /* XRUN recovery: apply software fade-in to prevent secondary pops */
+                    /* XRUN recovery: apply software fade-in */
                     size_t fade_frames = optimal_fade_frames; 
-                    if (fade_frames > bytes_to_write / frame_bytes) {
-                        fade_frames = bytes_to_write / frame_bytes;
+                    if (fade_frames > available_frames) {
+                        fade_frames = available_frames;
                     }
                     
                     if (fade_frames > 0 && rt_fade_buf) {
-                        memcpy(rt_fade_buf, data_ptr, fade_frames * frame_bytes);
+                        memcpy(rt_fade_buf, data_ptr, fade_frames * ctx->frame_bytes);
                         apply_fade(rt_fade_buf, fade_frames, cmd, true);
                         
                         snd_pcm_sframes_t rec_write = ALSA_WRITE(ctx->pcm, rt_fade_buf, fade_frames);
                         if (rec_write > 0) {
-                            ctx->play_offset += rec_write * frame_bytes;
-                            update_sync_base(ctx, cmd, 0);
+                            ctx->play_frames += rec_write;
+                            update_sync_base(ctx, 0);
                         }
                     }
-                    /* Continue to recalculate available data */
                     continue;
                 }
 
-                /* Handle generic hardware errors */
                 is_hw_error = true;
                 atomic_store(&stop_flag, 1);
                 break;
             }
 
-            if (written_frames > 0) {
-                /* Update byte offset */
-                ctx->play_offset += written_frames * frame_bytes;
-                update_sync_base(ctx, cmd, 0);
+            if (likely(written_frames > 0)) {
+                /* Advance cursor */
+                ctx->play_frames += written_frames;
+                update_sync_base(ctx, 0);
                 
                 if (shm) {
                     int current_st = atomic_load_explicit(&shm->state, memory_order_acquire);
@@ -2779,25 +2725,23 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         atomic_store_explicit(&shm->state, STATE_PLAYING, memory_order_release);
                     }
 
-                    size_t total_real_frames = ctx->play_offset / frame_bytes;
                     long acoustic;
-
-                    /* Calculate acoustic position */
                     if (unlikely(!ctx->is_cruising)) {
-                        /* Ramp-up phase: precise hardware delay polling */
+                        /* Ramp-up phase: buffer is filling. Poll hardware delay via ioctl syscall. */
                         long delay_frames = get_safe_alsa_delay(ctx, cmd);
                         ctx->continuous_frames += written_frames;
                         
-                        /* Lock cruise delay once buffer is physically full */
+                        /* Lock cruise delay once the DMA ring buffer is completely full.
+                           This eliminates ioctl() syscall overhead for the rest of the track. */
                         if (ctx->continuous_frames >= total_buffer_frames && delay_frames > 0) {
                             ctx->is_cruising = true;
                             ctx->cruise_delay = delay_frames;
                         }
                         
-                        acoustic = (long)total_real_frames - delay_frames;
+                        acoustic = (long)ctx->play_frames - delay_frames;
                     } else {
                         /* Cruise phase: zero-syscall lock-free projection */
-                        acoustic = (long)total_real_frames - ctx->cruise_delay;
+                        acoustic = (long)ctx->play_frames - ctx->cruise_delay;
                     }
 
                     if (acoustic < 0)
@@ -2806,7 +2750,6 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     atomic_store_explicit(&shm->current_frame, acoustic, memory_order_relaxed);
                 }
             } else {
-                /* Wait if no frames were written (bypassing alsa-lib wait) */
                 if (wait_for_alsa_or_command(ctx, cmd_efd, timeout_ms))
                     break;
             }
@@ -2819,28 +2762,28 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 snd_pcm_nonblock(ctx->pcm, 0);
 
                 long delay_frames = get_safe_alsa_delay(ctx, cmd);
-
                 long safety_margin = 1024;
-                size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
-                size_t read_offset = ctx->play_offset;
+                size_t read_frames = ctx->play_frames;
 
                 if (delay_frames > safety_margin) {
                     unsigned long rewind_amount = delay_frames - safety_margin;
                     snd_pcm_sframes_t actually_rewound = snd_pcm_rewind(ctx->pcm, rewind_amount);
                     
                     if (actually_rewound > 0) {
-                        size_t actual_rewind_bytes = actually_rewound * frame_bytes;
-                        read_offset = (ctx->play_offset >= actual_rewind_bytes) ? 
-                                      (ctx->play_offset - actual_rewind_bytes) : 0;
+                        read_frames = (ctx->play_frames >= (size_t)actually_rewound) ? 
+                                      (ctx->play_frames - actually_rewound) : 0;
                     }
                 }
 
                 size_t fade_frames = optimal_fade_frames;
-                size_t fade_bytes = fade_frames * frame_bytes;
+                size_t fade_bytes = fade_frames * ctx->frame_bytes;
 
-                size_t avail = get_available_bytes(ctx, cmd, read_offset);
-                if (avail >= fade_bytes) {
-                    memcpy(rt_fade_buf, ctx->data_start + read_offset, fade_bytes);
+                size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
+                size_t avail_frames = (live_frames > read_frames) ? (live_frames - read_frames) : 0;
+                
+                if (avail_frames >= fade_frames) {
+                    uint8_t *data_ptr = ctx->data_start + (read_frames * ctx->frame_bytes);
+                    memcpy(rt_fade_buf, data_ptr, fade_bytes);
                     apply_fade(rt_fade_buf, fade_frames, cmd, false);
                 } else {
                     memset(rt_fade_buf, 0, fade_bytes);
@@ -2852,8 +2795,8 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 ALSA_WRITE(ctx->pcm, rt_fade_buf, silence_frames);
 
                 /* Strict synchronization */
-                long total_written_frames = (read_offset / frame_bytes) + fade_frames + silence_frames;
-                long max_real_acoustic = (read_offset / frame_bytes) + fade_frames;
+                long total_written_frames = read_frames + fade_frames + silence_frames;
+                long max_real_acoustic = read_frames + fade_frames;
 
                 while (!atomic_load(&stop_flag)) {
                     int cmd_now = atomic_load_explicit(&shm->command, memory_order_acquire);
@@ -2868,7 +2811,6 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
 
                     long acoustic = total_written_frames - d_frames;
                     
-                    /* Clamp */
                     if (acoustic > max_real_acoustic)
                         acoustic = max_real_acoustic;
                     if (acoustic < 0)
@@ -2883,17 +2825,16 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 long final_delay = get_safe_alsa_delay(ctx, cmd);
                 long final_acoustic = total_written_frames - final_delay;
                 
-                /* Clamp to prevent skipping audio during resume */
                 if (final_acoustic > max_real_acoustic)
                     final_acoustic = max_real_acoustic;
-                if (final_acoustic < (long)(read_offset / frame_bytes)) {
-                    final_acoustic = read_offset / frame_bytes;
+                if (final_acoustic < (long)read_frames) {
+                    final_acoustic = read_frames;
                 }
 
                 snd_pcm_drop(ctx->pcm);
 
-                ctx->play_offset = final_acoustic * frame_bytes;
-                update_sync_base(ctx, cmd, 0);
+                ctx->play_frames = final_acoustic;
+                update_sync_base(ctx, 0);
 
                 if (shm) {
                     atomic_store_explicit(&shm->current_frame, final_acoustic, memory_order_release);
@@ -2906,7 +2847,6 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             }
 
             release_usb_dac(cmd);
-
             fast_revert_system_state(false, false);
             reset_process_priority();
 
@@ -2920,16 +2860,12 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         case SM_SLEEPING: {
             int current_cmd = atomic_load_explicit(&shm->command, memory_order_acquire);
             
-            /* Wake up on any active command */
             if (current_cmd != CMD_NONE && current_cmd != CMD_PAUSE)
                 break;
             
-            /* Sleep natively on eventfd instead of futex. */
             struct pollfd pfd = { .fd = cmd_efd, .events = POLLIN, .revents = 0 };
             poll(&pfd, 1, -1);
             
-            /* Drain eventfd immediately if woken by a command to prevent 
-               spurious poll() triggers in subsequent states. */
             if (pfd.revents & POLLIN) {
                 uint64_t dump;
                 bool read_happened = false;
@@ -2956,14 +2892,11 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             }
 
             if (!ctx->pcm) {
-                /* Re-acquire DAC and update card number */
                 acquire_usb_dac(cmd);
-                
                 fast_apply_system_state();
                 optimize_process(cmd->cpu_core);
 
                 char dev_name[64];
-                /* Use the updated card number */
                 snprintf(dev_name, sizeof(dev_name), "hw:%u,%u", cmd->card, cmd->device);
                 
                 int open_mode = SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT | SND_PCM_NO_SOFTVOL;
@@ -2972,7 +2905,6 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     snd_pcm_hw_params_alloca(&hwp);
                     snd_pcm_hw_params_any(ctx->pcm, hwp);
                     
-                    /* Reapply MMAP access configuration */
                     snd_pcm_access_t access = cmd->use_mmap ? SND_PCM_ACCESS_MMAP_INTERLEAVED : SND_PCM_ACCESS_RW_INTERLEAVED;
                     snd_pcm_hw_params_set_access(ctx->pcm, hwp, access);
                     
@@ -2995,18 +2927,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     snd_pcm_sw_params_set_avail_min(ctx->pcm, swp, cmd->period_size);
                     snd_pcm_sw_params_set_start_threshold(ctx->pcm, swp, req_buf);
                     
-                    /* Restore stop_threshold and tstamp_mode */
                     snd_pcm_sw_params_set_stop_threshold(ctx->pcm, swp, req_buf);
                     snd_pcm_sw_params_set_tstamp_mode(ctx->pcm, swp, SND_PCM_TSTAMP_NONE);
                     
                     snd_pcm_sw_params(ctx->pcm, swp);
-                    
-                    /* Ensure hardware is in PREPARED state */
                     snd_pcm_prepare(ctx->pcm);
-
                     snd_pcm_nonblock(ctx->pcm, 1);
 
-                    /* Update FD for Watcher */
                     ctx->alsa_fd = -1;
                     int count = snd_pcm_poll_descriptors_count(ctx->pcm);
                     if (count >= 1 && count < 16) {
@@ -3020,9 +2947,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
 
             if (ctx->pcm) {
                 /* Soft start sequence */
-                size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
                 size_t period_frames = cmd->period_size;
-                
                 snd_pcm_format_set_silence(cmd->format, rt_fade_buf, period_frames * cmd->channels);
 
                 size_t silence_frames = 512; 
@@ -3030,21 +2955,21 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     silence_frames = period_frames;
                 
                 size_t audio_frames = period_frames - silence_frames;
-                size_t audio_bytes = audio_frames * frame_bytes;
 
-                size_t avail_new = get_available_bytes(ctx, cmd, ctx->play_offset);
-                if (audio_bytes > avail_new) {
-                    audio_bytes = avail_new;
-                    audio_bytes -= (audio_bytes % frame_bytes);
-                    audio_frames = audio_bytes / frame_bytes;
+                size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
+                size_t avail_frames = (live_frames > ctx->play_frames) ? (live_frames - ctx->play_frames) : 0;
+                
+                if (audio_frames > avail_frames) {
+                    audio_frames = avail_frames;
                 }
 
-                if (audio_bytes > 0) {
-                    memcpy(rt_fade_buf + (silence_frames * frame_bytes), ctx->data_start + ctx->play_offset, audio_bytes);
+                if (audio_frames > 0) {
+                    uint8_t *data_ptr = ctx->data_start + (ctx->play_frames * ctx->frame_bytes);
+                    memcpy(rt_fade_buf + (silence_frames * ctx->frame_bytes), data_ptr, audio_frames * ctx->frame_bytes);
                     size_t fi_frames = optimal_fade_frames;
                     if (fi_frames > audio_frames)
                         fi_frames = audio_frames;
-                    apply_fade(rt_fade_buf + (silence_frames * frame_bytes), fi_frames, cmd, true);
+                    apply_fade(rt_fade_buf + (silence_frames * ctx->frame_bytes), fi_frames, cmd, true);
                 }
 
                 if (silence_frames + audio_frames > 0) {
@@ -3052,14 +2977,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     }
                 }
 
-                ctx->play_offset += audio_bytes;
-                update_sync_base(ctx, cmd, 0);
+                ctx->play_frames += audio_frames;
+                update_sync_base(ctx, 0);
                 
                 ctx->is_cruising = false;
                 ctx->continuous_frames = 0;
                 ctx->cruise_delay = 0;
                 
-                /* STATE_PLAYING will be set by SM_PLAYING on the first physical byte */
                 sm_state = SM_PLAYING;
             } else {
                 if (ctx->pcm) {
@@ -3067,11 +2991,9 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     ctx->pcm = NULL; 
                 }
                 
-                /* Sleep for 10ms on eventfd, immediately interruptible by Kotlin commands */
                 struct pollfd pfd = { .fd = cmd_efd, .events = POLLIN, .revents = 0 };
                 poll(&pfd, 1, 10);
                 
-                /* Drain eventfd if we were woken by a command rather than a timeout */
                 if (pfd.revents & POLLIN) {
                     uint64_t dump;
                     bool read_happened = false;
@@ -3092,13 +3014,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         case SM_DRAINING: {
             /* State: SM_DRAINING 
                Two-phase lock-free drain:
-               1. Write 'silence_frames_needed' to push the audio into the DAC.
+               1. Write 'silence_frames_needed' to push the real audio into the DAC.
                2. Wait non-blockingly until the DAC consumes all real audio.
             */
             long hw_delay = get_safe_alsa_delay(ctx, cmd);
 
             if (silence_frames_written >= silence_frames_needed) {
-                /* Phase 2: Wait for DMA flush. hw_delay <= silence means real audio reached DAC */
+                /* Phase 2: Wait for DMA flush. hw_delay <= silence means real audio reached speakers */
                 long target_delay = (long)silence_frames_written - 64;
                 if (target_delay < 0) target_delay = 0;
 
@@ -3121,15 +3043,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     if (read_happened) {
                         atomic_store_explicit(&ctx->wake_pending, false, memory_order_release);
                     }
-                    /* Command will be evaluated on the next loop iteration */
                 }
                 
                 goto update_drain_timer;
             }
             
+            /* Phase 1: Write pre-allocated silence to flush the real audio */
             size_t chunk_f = cmd->period_size;
-            
-            /* Phase 1: Write pre-allocated silence to flush the buffer */
             if (silence_frames_written + chunk_f > silence_frames_needed) {
                 chunk_f = silence_frames_needed - silence_frames_written;
             }
@@ -3152,7 +3072,6 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     if (w == -EINTR)
                         break;
                     
-                    /* Final exit condition: DAC starved, all audio has 100% played */
                     if (w == -EPIPE) { 
                         track_completed = true; 
                         break; 
@@ -3163,26 +3082,22 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     break;
                 } else if (w > 0) {
                     silence_frames_written += w;
-                    update_sync_base(ctx, cmd, silence_frames_written);
+                    update_sync_base(ctx, silence_frames_written);
                 }
             }
             
         update_drain_timer:
-            /* Timer synchronization */
             /* Smooth lock-free UI timer updates during drain */
             if (shm) {
                 long delay_sync = get_safe_alsa_delay(ctx, cmd);
-
-                size_t frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
-                size_t total_real_frames = ctx->play_offset / frame_bytes;
-
-                /* Calculate frames emitted from the speakers */
-                long frames_emitted = (total_real_frames + silence_frames_written) - delay_sync;
+                
+                /* Calculate frames physically emitted from the speakers */
+                long frames_emitted = (ctx->play_frames + silence_frames_written) - delay_sync;
                 
                 /* Restrict timer to valid acoustic frames, stripping trailing silence */
                 long acoustic = frames_emitted;
-                if (acoustic > total_real_frames)
-                    acoustic = total_real_frames;
+                if (acoustic > (long)ctx->play_frames)
+                    acoustic = ctx->play_frames;
                 if (acoustic < 0)
                     acoustic = 0;
                 
@@ -3203,10 +3118,9 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         free(rt_fade_buf);
     }
 
-    printf("\nPlayed %zu bytes. Remains %zu bytes.\n", ctx->play_offset, ctx->data_size > ctx->play_offset ? ctx->data_size - ctx->play_offset : 0);
+    printf("\nPlayed %zu frames. Remains %zu frames.\n", ctx->play_frames, ctx->data_frames > ctx->play_frames ? ctx->data_frames - ctx->play_frames : 0);
     
     if (ctx->pcm) {
-        /* Drop PCM immediately as DAC is either empty or playback was interrupted */
         snd_pcm_drop(ctx->pcm);
     }
     
@@ -3221,7 +3135,6 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     /* Graceful shutdown */
     atomic_store(&stop_flag, 1);
     
-    /* Wake up watcher thread to prevent deadlocks */
     atomic_store_explicit(&shm->command, CMD_EXIT, memory_order_release);
     sys_futex((int *)&shm->command, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
     
@@ -3320,6 +3233,11 @@ print_usage(const char *argv0)
 int
 main(int argc, char **argv)
 {
+    /* Disable alsa-lib internal thread-safety mutexes.
+       Since our isolated RT thread has exclusive access to the PCM handle,
+       internal locking is redundant and wastes CPU cycles (LOCK CMPXCHG). */
+    setenv("LIBASOUND_THREAD_SAFE", "0", 1);
+
     struct cmd cmd;
     struct optparse opts;
 
