@@ -1523,8 +1523,8 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
     char dev_name[64];
     snprintf(dev_name, sizeof(dev_name), "hw:%u,%u", cmd->card, cmd->device);
 
-    /* Disable software resampling and mixing */
-    int open_mode = SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT | SND_PCM_NO_SOFTVOL;
+    /* Disable software resampling, mixing, and force NONBLOCK at FD creation */
+    int open_mode = SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT | SND_PCM_NO_SOFTVOL | SND_PCM_NONBLOCK;
 
     int err = snd_pcm_open(&ctx->pcm, dev_name, SND_PCM_STREAM_PLAYBACK, open_mode);
     if (err < 0) {
@@ -1745,9 +1745,6 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
 
     /* Prepare buffer for initial start */
     snd_pcm_prepare(ctx->pcm);
-
-    /* Disable internal alsa-lib locks */
-    snd_pcm_nonblock(ctx->pcm, 1);
 
     /* Retrieve direct Kernel FD for lock-free ALSA bypass */
     ctx->alsa_fd = -1;
@@ -2899,7 +2896,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 char dev_name[64];
                 snprintf(dev_name, sizeof(dev_name), "hw:%u,%u", cmd->card, cmd->device);
                 
-                int open_mode = SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT | SND_PCM_NO_SOFTVOL;
+                int open_mode = SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT | SND_PCM_NO_SOFTVOL | SND_PCM_NONBLOCK;
                 if (snd_pcm_open(&ctx->pcm, dev_name, SND_PCM_STREAM_PLAYBACK, open_mode) == 0) {
                     snd_pcm_hw_params_t *hwp;
                     snd_pcm_hw_params_alloca(&hwp);
@@ -2932,7 +2929,6 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     
                     snd_pcm_sw_params(ctx->pcm, swp);
                     snd_pcm_prepare(ctx->pcm);
-                    snd_pcm_nonblock(ctx->pcm, 1);
 
                     ctx->alsa_fd = -1;
                     int count = snd_pcm_poll_descriptors_count(ctx->pcm);
