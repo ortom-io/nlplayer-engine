@@ -145,6 +145,49 @@ static char g_cpuset_root[128] = "/dev/cpuset";
 #ifndef MNT_DETACH
 #define MNT_DETACH 2
 #endif
+#ifndef SCHED_BATCH
+#define SCHED_BATCH 3
+#endif
+
+#ifndef IOPRIO_WHO_PROCESS
+#define IOPRIO_WHO_PROCESS 1
+#endif
+#ifndef IOPRIO_CLASS_BE
+#define IOPRIO_CLASS_BE 2
+#endif
+#ifndef IOPRIO_CLASS_IDLE
+#define IOPRIO_CLASS_IDLE 3
+#endif
+
+#ifndef SYS_gettid
+#ifdef __NR_gettid
+#define SYS_gettid __NR_gettid
+#elif defined(__aarch64__)
+#define SYS_gettid 178
+#elif defined(__x86_64__)
+#define SYS_gettid 186
+#else
+#define SYS_gettid 224
+#endif
+#endif
+
+#ifndef SYS_ioprio_set
+#ifdef __NR_ioprio_set
+#define SYS_ioprio_set __NR_ioprio_set
+#elif defined(__aarch64__)
+#define SYS_ioprio_set 30
+#elif defined(__x86_64__)
+#define SYS_ioprio_set 251
+#else
+#define SYS_ioprio_set 314
+#endif
+#endif
+
+static inline pid_t
+sys_gettid(void)
+{
+    return syscall(SYS_gettid);
+}
 
 /* --- GLOBALS --- */
 static int g_pm_qos_fd = -1;
@@ -217,6 +260,7 @@ struct ctx {
     /* --- BACKGROUND THREADS DATA --- */
     /* Written exclusively by the warmer_thread on standard cores */
     alignas(64) atomic_size_t live_file_frames;
+    int isolated_core;
 };
 
 struct cmd {
@@ -456,6 +500,8 @@ register_change(const char *path, const char *target_val, bool is_mount)
         snprintf(entry->target_val, sizeof(entry->target_val), "%s", target_val);
         
         entry->is_mount_point = true;
+        read_val(path, entry->original_val, sizeof(entry->original_val));
+        trim_newline(entry->original_val);
     } else {
         register_smart(path, target_val);
     }
@@ -1118,6 +1164,9 @@ fast_revert_system_state(bool full_cleanup, bool is_supervisor)
         if (g_state_cache[i].is_mount_point) {
             if (is_supervisor || full_cleanup) {
                 umount2(g_state_cache[i].path, MNT_DETACH);
+                if (g_state_cache[i].original_val[0] != '\0') {
+                    sys_write_opt(g_state_cache[i].path, g_state_cache[i].original_val);
+                }
             }
         } else {
             sys_write_opt(g_state_cache[i].path, g_state_cache[i].original_val);
@@ -1158,7 +1207,20 @@ create_and_enter_bunker(int cpu_core)
     /* Configure MEMS */
     snprintf(path_root, sizeof(path_root), "%s/%s", g_cpuset_root, f_mems);
     snprintf(temp, sizeof(temp), "%s/%s", path_bunker, f_mems);
+    
     read_val(path_root, buf, sizeof(buf));
+    
+    /* Fallback for pure Cgroup v2 environments where root cpuset.mems might be empty */
+    if (strlen(buf) == 0 && g_is_cgroup_v2) {
+        snprintf(path_root, sizeof(path_root), "%s/cpuset.mems.effective", g_cpuset_root);
+        read_val(path_root, buf, sizeof(buf));
+    }
+    
+    /* If still empty, safely fallback to NUMA node 0 (correct for all Android/ARM UMA systems) */
+    if (strlen(buf) == 0) {
+        strcpy(buf, "0");
+    }
+    
     sys_write_opt(temp, buf);
 
     /* Configure CPUS */
@@ -1172,11 +1234,11 @@ create_and_enter_bunker(int cpu_core)
         
         /* Try "isolated" partition (optimal for real-time audio) */
         if (!sys_write_opt(path_part, "isolated")) {
-             if (!sys_write_opt(path_part, "root")) {
-                 fprintf(stderr, "Warning: Failed to set Cgroup v2 partition (isolated/root). Real-time perf may suffer.\n");
-             } else {
-                 printf("Cgroup v2: partition set to 'root' (isolated not supported)\n");
-             }
+            if (!sys_write_opt(path_part, "root")) {
+                fprintf(stderr, "Warning: Failed to set Cgroup v2 partition (isolated/root). Real-time perf may suffer.\n");
+            } else {
+                printf("Cgroup v2: partition set to 'root' (isolated not supported)\n");
+            }
         }
     } else {
         snprintf(temp, sizeof(temp), "%s/cpu_exclusive", path_bunker);
@@ -1192,23 +1254,26 @@ create_and_enter_bunker(int cpu_core)
         sys_write_opt(temp, "0");
     }
 
-    /* Enter cgroup */
-    snprintf(temp, sizeof(temp), "%s/cgroup.procs", path_bunker);
-    int fd_tasks = open(temp, O_WRONLY | O_CLOEXEC);
+    /* Enter cgroup. At this stage (before pthread_create), the process 
+       consists of only the main ALSA RT thread. */
+    char buf_tid[32];
+    snprintf(buf_tid, sizeof(buf_tid), "%d", sys_gettid());
     
-    if (fd_tasks < 0 && !g_is_cgroup_v2) {
-        snprintf(temp, sizeof(temp), "%s/tasks", path_bunker);
-        fd_tasks = open(temp, O_WRONLY | O_CLOEXEC);
-    }
-
-    if (fd_tasks >= 0) {
-        snprintf(buf, sizeof(buf), "%d", getpid());
-        if (write(fd_tasks, buf, strlen(buf)) < 0) {
-            fprintf(stderr, "WARNING: Failed to enter bunker cgroup: %s\n", strerror(errno));
-        }
-        close(fd_tasks);
+    if (g_is_cgroup_v2) {
+        /* Since we use partition="isolated", this cgroup becomes a domain root
+           and cannot be a threaded controller. We must write to cgroup.procs
+           to move the entire process. Background threads will escape this 
+           domain later upon creation. */
+        snprintf(temp, sizeof(temp), "%s/cgroup.procs", path_bunker);
+        sys_write_opt(temp, buf_tid);
     } else {
-        perror("Failed to enter bunker");
+        /* In Cgroup v1, thread-level granularity via 'tasks' is standard */
+        snprintf(temp, sizeof(temp), "%s/tasks", path_bunker);
+        if (!sys_write_opt(temp, buf_tid)) {
+            /* Fallback for older kernels */
+            snprintf(temp, sizeof(temp), "%s/cgroup.procs", path_bunker);
+            sys_write_opt(temp, buf_tid);
+        }
     }
 
     if (mount(path_bunker, path_bunker, "", MS_BIND, NULL) == 0) {
@@ -1250,6 +1315,7 @@ reset_process_priority(void)
     
     sched_setscheduler(0, SCHED_OTHER, &sp);
     setpriority(PRIO_PROCESS, 0, 0);
+    syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, (IOPRIO_CLASS_BE << 13) | 4);
 }
 
 /* =========================================================================
@@ -1459,6 +1525,7 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
     ctx->fd = -1; 
     ctx->map_start = MAP_FAILED;
     atomic_init(&ctx->wake_pending, false);
+    ctx->isolated_core = cmd->cpu_core;
 
     if (map_file(ctx, cmd) != 0) {
         return -1;
@@ -1850,6 +1917,95 @@ ctx_free(struct ctx *ctx)
         close(ctx->fd);
 }
 
+/* Configures strict I/O scheduling, and if an RT core is specified,
+   relocates background threads from it to prevent cache thrashing
+   and applies power-collapse packing. */
+static void
+evict_thread_from_rt_core(int rt_core, bool is_warmer)
+{
+    prctl(PR_SET_NAME, is_warmer ? "io_warmer" : "ipc_watcher", 0, 0, 0);
+
+    if (rt_core >= 0) {
+        pid_t tid = sys_gettid();
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", tid);
+
+        /* Cgroup v2 with 'isolated' partition strictly creates a Domain Root,
+           forbidding moving individual threads out. Therefore, we only attempt 
+           thread-level cgroup migration on Cgroup v1 (tasks).
+           WARNING: In pure v2, because the thread cannot escape the cgroup, 
+           sched_setaffinity will also fail (EINVAL). Background threads will 
+           remain trapped on the RT core. This is a hard Linux architectural limit 
+           for multi-threaded apps using v2 isolated partitions. */
+        if (!g_is_cgroup_v2) {
+            const char *paths_v1[] = {
+                "%s/system-background/tasks",
+                "%s/background/tasks",
+                "%s/tasks",
+                NULL
+            };
+            
+            char path[256];
+            for (int i = 0; paths_v1[i] != NULL; i++) {
+                snprintf(path, sizeof(path), paths_v1[i], g_cpuset_root);
+                if (sys_write_opt(path, buf))
+                    break;
+            }
+        }
+
+        /* Single-core packing: groups sleeping threads to allow PMIC C-states */
+        long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+        if (num_cores < 1)
+            num_cores = 4;
+
+        cpu_set_t cpuset;
+        bool pinned = false;
+
+        for (int i = 0; i < num_cores; i++) {
+            if (i == rt_core)
+                continue;
+
+            CPU_ZERO(&cpuset);
+            CPU_SET(i, &cpuset);
+            
+            /* Attempt to physically evict thread from the RT core.
+               In v1 (escaped), this succeeds. In v2 (trapped), this returns -EINVAL. */
+            if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == 0) {
+                pinned = true;
+                break; 
+            }
+        }
+
+        if (!pinned) {
+            CPU_ZERO(&cpuset);
+            for (int i = 0; i < num_cores; i++) {
+                if (i != rt_core)
+                    CPU_SET(i, &cpuset);
+            }
+            sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+        }
+    }
+
+    /* Always reset inherited SCHED_FIFO priority from the parent RT thread */
+    struct sched_param sp = { .sched_priority = 0 };
+    sched_setscheduler(0, SCHED_OTHER, &sp);
+
+    if (is_warmer) {
+        /* Prevent page-fault starvation while granting disk priority */
+        setpriority(PRIO_PROCESS, 0, 0);
+        syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, (IOPRIO_CLASS_BE << 13) | 4);
+    } else {
+        /* Prioritize UI responsiveness, detach from disk I/O */
+        setpriority(PRIO_PROCESS, 0, -2);
+        if (syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, (IOPRIO_CLASS_IDLE << 13) | 0) < 0) {
+            syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, (IOPRIO_CLASS_BE << 13) | 7);
+        }
+    }
+
+    /* Hardware pipeline flush */
+    sched_yield();
+}
+
 /* Arguments for the watcher thread */
 struct watcher_args {
     pthread_t main_tid;
@@ -1862,13 +2018,8 @@ struct watcher_args {
 static void *
 shm_watcher_thread(void *arg)
 {
-    /* Lower thread priority to prevent audio interference */
-    struct sched_param sp;
-    sp.sched_priority = 0;
-    sched_setscheduler(0, SCHED_OTHER, &sp);
-    setpriority(PRIO_PROCESS, 0, 19);
-
     struct watcher_args *wargs = (struct watcher_args *)arg;
+    evict_thread_from_rt_core(wargs->cmd->cpu_core, false);
     
     while (!atomic_load(&stop_flag)) {
         int current_cmd;
@@ -1934,13 +2085,10 @@ shm_watcher_thread(void *arg)
 static void *
 memory_warmer_thread(void *arg)
 {
-    /* Lower priority to avoid resource contention with audio */
-    struct sched_param sp;
-    sp.sched_priority = 0;
-    sched_setscheduler(0, SCHED_OTHER, &sp);
-    setpriority(PRIO_PROCESS, 0, 19); 
-
     struct ctx *ctx = (struct ctx *)arg;
+    
+    evict_thread_from_rt_core(ctx->isolated_core, true);
+
     const size_t page_size = sysconf(_SC_PAGESIZE);
     size_t warmed_offset = 0;
     size_t header_size = ctx->data_start - ctx->map_start;
@@ -2864,7 +3012,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
 
                 /* Revert real-time CPU isolation and USB hardware overrides to conserve battery */
                 release_usb_dac(cmd);
-                fast_revert_system_state(false, false);
+                fast_revert_system_state(true, false);
                 reset_process_priority();
 
                 sm_state = SM_SLEEPING;
