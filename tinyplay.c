@@ -114,14 +114,6 @@ static char g_cpuset_root[128] = "/dev/cpuset";
 #define STATE_ERROR 3
 #define STATE_DRAINING 4
 
-/* Standard WAV Defines */
-#define ID_RIFF 0x46464952
-#define ID_WAVE 0x45564157
-#define ID_FMT  0x20746d66
-#define ID_DATA 0x61746164
-#define WAVE_FORMAT_PCM 0x0001
-#define WAVE_FORMAT_IEEE_FLOAT 0x0003
-
 /* Priority Defines */
 #ifndef IOPRIO_CLASS_RT
 #define IOPRIO_CLASS_RT 1
@@ -211,26 +203,6 @@ volatile atomic_int signal_event = 0;
 static volatile atomic_int stop_flag = 0;
 
 /* Standard Structures */
-struct riff_wave_header {
-    uint32_t riff_id;
-    uint32_t riff_sz;
-    uint32_t wave_id;
-} __attribute__((packed));
-
-struct chunk_header {
-    uint32_t id;
-    uint32_t sz;
-} __attribute__((packed));
-
-struct chunk_fmt {
-    uint16_t audio_format;
-    uint16_t num_channels;
-    uint32_t sample_rate;
-    uint32_t byte_rate;
-    uint16_t block_align;
-    uint16_t bits_per_sample;
-} __attribute__((packed));
-
 struct ctx {
     snd_pcm_t *pcm;
     int fd;
@@ -248,10 +220,7 @@ struct ctx {
     size_t continuous_frames;
     bool is_cruising;
     long cruise_delay; 
-    struct chunk_fmt fmt;
-    uint16_t valid_bits_per_sample;
-    bool is_float_ext;
-    
+
     /* --- RT THREAD DATA --- */
     /* Written exclusively by the isolated audio core */
     alignas(64) atomic_size_t sync_base_frames;
@@ -265,7 +234,6 @@ struct ctx {
 
 struct cmd {
     const char *filename;
-    const char *filetype;
     unsigned int card;
     unsigned int device;
     int flags;
@@ -276,9 +244,7 @@ struct cmd {
     snd_pcm_uframes_t period_size;
     unsigned int period_count;
 
-    unsigned int bits;
     int cpu_core;
-    bool is_float;
     const char *shm_file;
     size_t expected_size;
     bool use_mmap;
@@ -286,6 +252,7 @@ struct cmd {
     char usb_uevent_path[PATH_MAX];
     bool dac_claimed;
     bool use_unbind;
+    int freq_percent;
 };
 
 /* --- ROBUST I/O HELPERS --- */
@@ -723,8 +690,74 @@ detect_cpuset_path(void)
     }
 }
 
+static void
+get_optimal_target_freq(int cpu_core, char *out_freq, size_t out_size, int percent)
+{
+    char path[128];
+    char buf[1024];
+    long freqs[128];
+    int count = 0;
+    long max_freq = 0;
+    
+    out_freq[0] = '\0';
+    
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_available_frequencies", cpu_core);
+    read_val(path, buf, sizeof(buf));
+    trim_newline(buf);
+    
+    if (strlen(buf) > 0) {
+        char *ptr = buf;
+        char *endptr;
+        
+        while (*ptr) {
+            while (*ptr && (*ptr == ' ' || *ptr == '\t'))
+                ptr++;
+            if (!*ptr)
+                break;
+            
+            long f = strtol(ptr, &endptr, 10);
+            if (f > 0 && count < 128) {
+                freqs[count++] = f;
+                if (f > max_freq)
+                    max_freq = f;
+            }
+            ptr = endptr;
+        }
+    }
+    
+    /* Fallback for EAS kernels where frequencies are hidden */
+    if (max_freq == 0) {
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu_core);
+        read_val(path, buf, sizeof(buf));
+        max_freq = strtol(buf, NULL, 10);
+        
+        if (max_freq > 0) {
+            snprintf(out_freq, out_size, "%ld", (max_freq * percent) / 100);
+        }
+        return;
+    }
+    
+    /* Find the closest hardware-supported frequency step */
+    long target_freq = (max_freq * percent) / 100;
+    long best_freq = freqs[0];
+    long min_diff = LONG_MAX;
+    
+    for (int i = 0; i < count; i++) {
+        long diff = freqs[i] - target_freq;
+        if (diff < 0)
+            diff = -diff;
+        
+        if (diff < min_diff) {
+            min_diff = diff;
+            best_freq = freqs[i];
+        }
+    }
+    
+    snprintf(out_freq, out_size, "%ld", best_freq);
+}
+
 void
-precalc_system_state(int target_core)
+precalc_system_state(int target_core, int freq_percent)
 {
     g_state_count = 0;
     char path[128], buf[64], cluster_cpus[64] = { 0 };
@@ -760,36 +793,58 @@ precalc_system_state(int target_core)
             continue;
         }
 
-        /* CPU Performance governor */
+        /* Apply performance governor baseline */
         snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", i);
-        register_smart(path, "performance");
-
-        /* Lock CPU frequency */
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", i);
         if (file_exists(path)) {
-            read_val(path, buf, sizeof(buf));
-            trim_newline(buf);
+            register_smart(path, "performance");
+        }
+
+        /* Calculate optimal target frequency */
+        char optimal_freq[64] = { 0 };
+        get_optimal_target_freq(i, optimal_freq, sizeof(optimal_freq), freq_percent);
+
+        if (strlen(optimal_freq) > 0) {
+            char hw_min_path[128], hw_max_path[128];
+            char hw_min_val[64], hw_max_val[64];
             
-            if (strlen(buf) > 0) {
-                snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_min_freq", i);
-                register_smart(path, buf);
+            snprintf(hw_min_path, sizeof(hw_min_path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_min_freq", i);
+            snprintf(hw_max_path, sizeof(hw_max_path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+            
+            read_val(hw_min_path, hw_min_val, sizeof(hw_min_val));
+            trim_newline(hw_min_val);
+            read_val(hw_max_path, hw_max_val, sizeof(hw_max_val));
+            trim_newline(hw_max_val);
+
+            if (strlen(hw_min_val) > 0 && strlen(hw_max_val) > 0) {
+                char path_min[128], path_max[128];
+                char path_min_alias[128], path_max_alias[128];
                 
-                char hw_min_path[128];
-                char hw_min_val[64];
-                snprintf(hw_min_path, sizeof(hw_min_path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_min_freq", i);
+                snprintf(path_min, sizeof(path_min), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_min_freq", i);
+                snprintf(path_max, sizeof(path_max), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", i);
                 
-                if (file_exists(hw_min_path)) {
-                    read_val(hw_min_path, hw_min_val, sizeof(hw_min_val));
-                    trim_newline(hw_min_val);
-                    
-                    if (strlen(hw_min_val) > 0 && g_state_count > 0) {
-                        state_entry_t *last_entry = &g_state_cache[g_state_count - 1];
-                        
-                        if (strstr(last_entry->path, "scaling_min_freq")) {
-                             snprintf(last_entry->original_val, sizeof(last_entry->original_val), "%s", hw_min_val);
+                /* POSIX Path Alias trick (using "/./") to bypass register_smart strcmp deduplication.
+                   This allows us to queue multiple writes to the same sysfs node cleanly. */
+                snprintf(path_min_alias, sizeof(path_min_alias), "/sys/devices/system/cpu/cpu%d/cpufreq/./scaling_min_freq", i);
+                snprintf(path_max_alias, sizeof(path_max_alias), "/sys/devices/system/cpu/cpu%d/cpufreq/./scaling_max_freq", i);
+
+                /* PHASE 1: Queue opening the window to hardware limits (Avoids -EINVAL race condition) */
+                register_smart(path_min, hw_min_val);
+                register_smart(path_max, hw_max_val);
+
+                /* Battery Saver Hack: Override the backup of path_min to the true hardware minimum.
+                   Prevents the phone from being locked awake if Input Boost was active during launch. */
+                if (g_state_count > 0) {
+                    for (int j = g_state_count - 1; j >= 0; j--) {
+                        if (strcmp(g_state_cache[j].path, path_min) == 0) {
+                             snprintf(g_state_cache[j].original_val, sizeof(g_state_cache[j].original_val), "%s", hw_min_val);
+                             break;
                         }
                     }
                 }
+
+                /* PHASE 2: Queue locking the target frequency via aliases */
+                register_smart(path_min_alias, optimal_freq);
+                register_smart(path_max_alias, optimal_freq);
             }
         }
 
@@ -1084,7 +1139,7 @@ fast_apply_system_state(void)
     if (g_pm_qos_fd < 0) {
         int qos_fd = open("/dev/cpu_dma_latency", O_RDWR | O_CLOEXEC);
         if (qos_fd >= 0) {
-            int32_t lat = 0;
+            int32_t lat = 10;
             if (write(qos_fd, &lat, sizeof(lat)) < 0) {
                 fprintf(stderr, "WARNING: Failed to lock CPU DMA latency: %s\n", strerror(errno));
             }
@@ -1372,126 +1427,26 @@ setup_child_signals(void)
 }
 
 static int
-parse_wav_headers(struct ctx *ctx)
-{
-    uint8_t *ptr = ctx->map_start;
-    size_t file_size = ctx->map_size;
-    
-    if (file_size < sizeof(struct riff_wave_header)) {
-        fprintf(stderr, "Error: File too small\n");
-        return -1;
-    }
-    
-    struct riff_wave_header *riff = (struct riff_wave_header *)ptr;
-    if (riff->riff_id != ID_RIFF || riff->wave_id != ID_WAVE) {
-        fprintf(stderr, "Error: Not a valid WAV file (Bad RIFF/WAVE signature)\n");
-        return -1;
-    }
-    
-    size_t offset = sizeof(struct riff_wave_header);
-    bool found_fmt = false;
-    bool found_data = false;
-
-    while (offset < file_size) {
-        if (offset + sizeof(struct chunk_header) > file_size) {
-            break; 
-        }
-
-        struct chunk_header *chk = (struct chunk_header *)(ptr + offset);
-        uint32_t chunk_id = chk->id;
-        uint32_t chunk_size = chk->sz;
-        
-        offset += sizeof(struct chunk_header);
-
-        if (offset > file_size || chunk_size > file_size - offset) {
-            if (chunk_id == ID_DATA) {
-                chunk_size = file_size - offset;
-                fprintf(stderr, "Warning: Data chunk truncated, playing available data.\n");
-            } else {
-                fprintf(stderr, "Warning: Corrupted metadata chunk found, stopping scan.\n");
-                break;
-            }
-        }
-
-        if (chunk_id == ID_FMT) {
-            if (chunk_size < sizeof(struct chunk_fmt)) {
-                fprintf(stderr, "Error: FMT chunk too small (%u)\n", chunk_size);
-                return -1;
-            }
-            memcpy(&ctx->fmt, ptr + offset, sizeof(struct chunk_fmt));
-            
-            /* Read WAVE_FORMAT_EXTENSIBLE */
-            ctx->valid_bits_per_sample = ctx->fmt.bits_per_sample;
-            ctx->is_float_ext = false;
-
-            if (ctx->fmt.audio_format == 0xFFFE && chunk_size >= sizeof(struct chunk_fmt) + 24) {
-                /* Read ValidBitsPerSample (offset +18 from chunk start) */
-                ctx->valid_bits_per_sample = *(uint16_t *)(ptr + offset + sizeof(struct chunk_fmt) + 2);
-                /* Read GUID (offset +24 from chunk start). 0x03 = Float, 0x01 = PCM */
-                uint8_t *guid = (uint8_t *)(ptr + offset + sizeof(struct chunk_fmt) + 8);
-                if (guid[0] == 0x03) { 
-                    ctx->is_float_ext = true;
-                }
-            }
-            found_fmt = true;
-        } else if (chunk_id == ID_DATA) {
-            ctx->data_start = ptr + offset;
-            
-            if (chunk_size == 0 || chunk_size == 0xFFFFFFFF || chunk_size > file_size - offset) {
-                ctx->data_size = file_size - offset; /* Trust the actual file size */
-            } else {
-                ctx->data_size = chunk_size;
-            }
-            
-            found_data = true;
-        }
-        
-        size_t real_advance = chunk_size + (chunk_size % 2);
-        
-        if (file_size - offset < real_advance) {
-            offset = file_size;
-        } else {
-            offset += real_advance;
-        }
-        
-        if (found_fmt && found_data)
-            break;
-    }
-
-    if (!found_fmt || !found_data) {
-        fprintf(stderr, "Error: Required WAV chunks (FMT/DATA) not found.\n");
-        return -1;
-    }
-    return 0;
-}
-
-static int
 map_file(struct ctx *ctx, struct cmd *cmd)
 {
-    /* Open read-only */
+    /* Enforce O_RDONLY to support accessing /proc/<pid>/fd/ across namespaces.
+       O_NOATIME prevents the kernel from locking the tmpfs inode to update 
+       access timestamps, saving CPU cache lines and reducing micro-jitter. */
     ctx->fd = open(cmd->filename, O_RDONLY | O_CLOEXEC | O_NOATIME);
-    if (ctx->fd < 0)
-        ctx->fd = open(cmd->filename, O_RDONLY | O_CLOEXEC);
     if (ctx->fd < 0) {
-        perror("Failed to open file");
+        perror("Failed to open audio memfd");
         return -1;
     }
 
-    struct stat sb; 
+    struct stat sb;
     if (fstat(ctx->fd, &sb) == -1) {
         perror("fstat failed");
         close(ctx->fd);
         return -1;
     }
     
-    /* live_file_frames initialized later in ctx_init */
-
-    if (cmd->expected_size > 0) {
-        /* Map to expected_size for live streaming. Pages will be mapped upon write. */
-        ctx->map_size = cmd->expected_size;
-    } else {
-        ctx->map_size = sb.st_size;
-    }
+    /* Map to expected capacity if dynamic, otherwise use physical size */
+    ctx->map_size = (cmd->expected_size > 0) ? cmd->expected_size : sb.st_size;
 
     int flags = MAP_SHARED;
     if (cmd->expected_size == 0) {
@@ -1510,10 +1465,6 @@ map_file(struct ctx *ctx, struct cmd *cmd)
 #ifdef MADV_HUGEPAGE
     madvise(ctx->map_start, ctx->map_size, MADV_HUGEPAGE);
 #endif
-    madvise(ctx->map_start, ctx->map_size, MADV_SEQUENTIAL);
-    if (cmd->expected_size == 0) {
-        madvise(ctx->map_start, ctx->map_size, MADV_WILLNEED);
-    }
 
     return 0;
 }
@@ -1531,61 +1482,9 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
         return -1;
     }
 
-    if (cmd->filetype && strcmp(cmd->filetype, "raw") == 0) {
-        ctx->data_start = ctx->map_start;
-        ctx->data_size = (cmd->expected_size > 0) ? cmd->expected_size : ctx->map_size;
-        
-        if (cmd->bits == 32) {
-            cmd->format = SND_PCM_FORMAT_S32_LE;
-        } else if (cmd->bits == 24) {
-            cmd->format = SND_PCM_FORMAT_S24_3LE;
-        } else {
-            cmd->format = SND_PCM_FORMAT_S16_LE;
-        }
-    } else {
-        if (parse_wav_headers(ctx) != 0) {
-            munmap(ctx->map_start, ctx->map_size);
-            close(ctx->fd);
-            return -1;
-        }
-
-        cmd->channels = ctx->fmt.num_channels;
-        cmd->rate = ctx->fmt.sample_rate;
-        cmd->bits = ctx->valid_bits_per_sample; /* Use actual bit depth */
-
-        /* Determine container for 24-bit */
-        int container_bytes = ctx->fmt.block_align / cmd->channels;
-
-        if (ctx->fmt.audio_format == WAVE_FORMAT_IEEE_FLOAT || ctx->is_float_ext) {
-            cmd->format = (cmd->bits == 64) ? SND_PCM_FORMAT_FLOAT64_LE : SND_PCM_FORMAT_FLOAT_LE;
-            cmd->is_float = true;
-        } else {
-            switch (cmd->bits) {
-            case 8:
-                cmd->format = SND_PCM_FORMAT_U8;
-                break;
-            case 16:
-                cmd->format = SND_PCM_FORMAT_S16_LE;
-                break;
-            case 24: 
-                if (container_bytes == 3) {
-                    cmd->format = SND_PCM_FORMAT_S24_3LE;
-                } else if (container_bytes == 4) {
-                    cmd->format = SND_PCM_FORMAT_S24_LE;
-                } else {
-                    fprintf(stderr, "Fatal: Unsupported 24-bit container\n");
-                    return -1;
-                }
-                break;
-            case 32:
-                cmd->format = SND_PCM_FORMAT_S32_LE;
-                break;
-            default:
-                cmd->format = SND_PCM_FORMAT_S16_LE;
-                break;
-            }
-        }
-    }
+    /* Treat all incoming data as Raw PCM */
+    ctx->data_start = ctx->map_start;
+    ctx->data_size = (cmd->expected_size > 0) ? cmd->expected_size : ctx->map_size;
 
     char dev_name[64];
     snprintf(dev_name, sizeof(dev_name), "hw:%u,%u", cmd->card, cmd->device);
@@ -1834,9 +1733,7 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
 
     struct stat sb;
     if (fstat(ctx->fd, &sb) == 0) {
-        size_t header_size = ctx->data_start - ctx->map_start;
-        size_t initial_payload = (sb.st_size > header_size) ? (sb.st_size - header_size) : 0;
-        atomic_init(&ctx->live_file_frames, initial_payload / ctx->frame_bytes);
+        atomic_init(&ctx->live_file_frames, sb.st_size / ctx->frame_bytes);
     } else {
         atomic_init(&ctx->live_file_frames, 0);
     }
@@ -1848,17 +1745,16 @@ void
 init_shm(uint64_t total_frames, struct cmd *cmd)
 {
     const char *shm_path = cmd ? cmd->shm_file : g_shm_path;
-    int fd = open(shm_path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    
+    /* Attempt to open without O_CREAT first for safe cross-namespace symlink resolution */
+    int fd = open(shm_path, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        fd = open(shm_path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    
     if (fd < 0)
         return;
 
-    struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
-    if (fcntl(fd, F_SETLK, &fl) == -1) {
-        fprintf(stderr, "Error: Another instance is running (locked SHM at %s).\n", shm_path);
-        close(fd);
-        exit(EXIT_FAILURE); 
-    }
-    
+    /* Removed F_SETLK to prevent EACCES/ENOLCK across namespaces */
     fchmod(fd, 0666); 
     ftruncate(fd, sizeof(struct player_ctrl));
     
@@ -2081,7 +1977,7 @@ shm_watcher_thread(void *arg)
 }
 
 /* RT Memory Prefetcher
-   Isolates main audio thread from disk latency (Page Faults). */
+   Isolates main audio thread from memory mapping latency (Page Faults). */
 static void *
 memory_warmer_thread(void *arg)
 {
@@ -2091,44 +1987,43 @@ memory_warmer_thread(void *arg)
 
     const size_t page_size = sysconf(_SC_PAGESIZE);
     size_t warmed_offset = 0;
-    size_t header_size = ctx->data_start - ctx->map_start;
     
     while (!atomic_load(&stop_flag)) {
         bool is_ffmpeg_done = (shm && atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire) > 0);
         struct stat st;
         
-        /* Query physical file size in the background telemetry thread */
-        if (fstat(ctx->fd, &st) == 0 && st.st_size > 0) {
-            size_t available_size = st.st_size;
-            if (available_size > ctx->map_size)
-                available_size = ctx->map_size;
-            
-            /* Pre-fault memory to isolate I/O latency (page faults) from RT thread */
-            if (warmed_offset < available_size) {
-                /* Asynchronously ask the kernel to prepare the ENTIRE chunk at once.
-                   One syscall instead of thousands to prevent VMA lock contention. */
-                madvise(ctx->map_start + warmed_offset, available_size - warmed_offset, MADV_WILLNEED);
+        /* Fast atomic query of the underlying memfd size to detect JNI write progress */
+        if (fstat(ctx->fd, &st) == 0) {
+            if (st.st_size > 0) {
+                size_t available_size = st.st_size;
+                if (available_size > ctx->map_size)
+                    available_size = ctx->map_size;
                 
-                while (warmed_offset < available_size && !atomic_load(&stop_flag)) {
-                    /* Synchronously force a hardware Page Fault */
-                    __asm__ __volatile__ ("" : : "r" (ctx->map_start[warmed_offset]) : "memory");
-                    
-                    warmed_offset += page_size;
+                /* Trigger minor page faults in the background to resolve PTEs.
+                   Since memfd is RAM-backed, this isolates the RT thread from 
+                   kernel MMU spinlocks completely. */
+                if (warmed_offset < available_size) {
+                    /* Trace memory prefetching throughput to ensure it outpaces DAC consumption */
+                    while (warmed_offset < available_size && !atomic_load(&stop_flag)) {
+                        __asm__ __volatile__ ("" : : "r" (ctx->map_start[warmed_offset]) : "memory");
+                        warmed_offset += page_size;
+                    }
+                }
+                
+                /* Publish safe mapped boundary directly for the lock-free state machine */
+                size_t available_frames = available_size / ctx->frame_bytes;
+                atomic_store_explicit(&ctx->live_file_frames, available_frames, memory_order_release);
+                
+                /* Clean exit: JNI decoding is complete and all pages are locked in RAM */
+                if (is_ffmpeg_done && warmed_offset >= available_size) {
+                    break;
                 }
             }
-            
-            /* Calculate frames in background and publish safe readable boundary */
-            size_t payload_bytes = (available_size > header_size) ? (available_size - header_size) : 0;
-            size_t available_frames = payload_bytes / ctx->frame_bytes;
-            atomic_store_explicit(&ctx->live_file_frames, available_frames, memory_order_release);
-            
-            /* Clean exit: background decoding is complete and all pages are locked in RAM */
-            if (is_ffmpeg_done && warmed_offset >= available_size) {
+        } else {
+            /* Exit if fstat fails (e.g. file unlinked, safety net) */
+            if (is_ffmpeg_done) {
                 break;
             }
-        } else if (is_ffmpeg_done) {
-            /* Exit if file is complete but fstat failed (safety net) */
-            break;
         }
         
         /* 2ms tick: balance CPU load vs RT thread starvation */
@@ -2516,6 +2411,10 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                         break;
                     }
                 } else if (c == CMD_PAUSE) {
+                    /* Consume command to CMD_NONE immediately to prevent eventfd ping-pong */
+                    int expected_cmd = CMD_PAUSE;
+                    atomic_compare_exchange_strong_explicit(&shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
+                    
                     if (sm_state == SM_PLAYING || sm_state == SM_DRAINING) {
                         fade_is_exit = false;
                         sm_state = SM_FADING_OUT_INIT;
@@ -2600,7 +2499,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                                         uint8_t *data_ptr = ctx->data_start + (target_frames * ctx->frame_bytes);
                                         memcpy(rt_fade_buf, data_ptr, fade_bytes);
                                         apply_fade(rt_fade_buf, fade_frames, cmd, true);
-                                        
+
                                         snd_pcm_sframes_t written = ALSA_WRITE(ctx->pcm, rt_fade_buf, fade_frames);
                                         long actual_written = (written > 0) ? written : 0;
                                         ctx->play_frames = target_frames + actual_written;
@@ -2694,8 +2593,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                             update_sync_base(ctx, 0);
                             atomic_store_explicit(&shm->current_frame, target_frame, memory_order_release);
                             
-                            int expected_none = CMD_NONE;
-                            atomic_compare_exchange_strong_explicit(&shm->command, &expected_none, CMD_PAUSE, memory_order_release, memory_order_relaxed);
+                            /* Update state for JNI. Never mutate command channel internally. */
                             atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
                             sm_state = SM_SLEEPING;
                         }
@@ -2713,10 +2611,10 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 break;
             }
 
-            /* Read the EOF flag once for the entire state */
-            uint64_t is_ffmpeg_done = 0;
+            /* Read exact total frames declared by JNI */
+            uint64_t exact_total = 0;
             if (shm)
-                is_ffmpeg_done = atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire);
+                exact_total = atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire);
 
             /* Determine available frames (Lock-free, 0 divisions) */
             size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
@@ -2727,8 +2625,13 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             }
 
             if (unlikely(!available_frames)) {
-                /* Handle EOF or expected file end */
-                if (is_ffmpeg_done > 0 || (ctx->data_frames > 0 && ctx->play_frames >= ctx->data_frames)) {
+                /* Handle EOF or expected file end:
+                   Transition to DRAINING ONLY if we have physically played the exact amount 
+                   of frames declared by the decoder, ensuring we don't truncate the audio 
+                   if the warmer_thread is slightly lagging behind. */
+                if ((exact_total > 0 && ctx->play_frames >= exact_total) || 
+                    (ctx->data_frames > 0 && ctx->play_frames >= ctx->data_frames)) {
+                    
                     /* Transition to DRAINING */
                     long current_delay = get_safe_alsa_delay(ctx, cmd);
                     if (current_delay <= 0) {
@@ -2743,7 +2646,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     sm_state = SM_DRAINING;
                     continue;
                 } else {
-                    /* Wait for ffmpeg. 1ms sleep yields the core to the scheduler */
+                    /* Wait for JNI or warmer_thread. 1ms sleep yields the core to the scheduler */
                     usleep(1000);
                     continue;
                 }
@@ -2755,12 +2658,19 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 frames_to_write = chunk_frames;
 
             uint8_t *data_ptr = ctx->data_start + (ctx->play_frames * ctx->frame_bytes);
-            __builtin_prefetch(data_ptr, 0, 3);
 
             /* Handle incomplete periods */
             if (unlikely(frames_to_write < chunk_frames)) {
-                if (is_ffmpeg_done > 0) {
-                    /* EOF reached. Pad the final incomplete chunk with silence to safely flush it to ALSA. */
+                bool is_true_eof = false;
+                
+                if (exact_total > 0 && (ctx->play_frames + frames_to_write) >= exact_total) {
+                    is_true_eof = true;
+                } else if (ctx->data_frames > 0 && (ctx->play_frames + frames_to_write) >= ctx->data_frames) {
+                    is_true_eof = true;
+                }
+
+                if (is_true_eof) {
+                    /* True EOF reached. Pad the final incomplete chunk with silence to safely flush it to ALSA. */
                     size_t bytes_to_copy = frames_to_write * ctx->frame_bytes;
                     size_t frames_missing = chunk_frames - frames_to_write;
                     
@@ -2770,17 +2680,14 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     data_ptr = rt_fade_buf;
                     frames_to_write = chunk_frames;
                 } else {
-                    /* Stream is live, ffmpeg just hasn't delivered a full chunk yet.
+                    /* Stream is live, JNI just hasn't delivered a full chunk yet.
                        WE MUST NOT PAD! If we pad, we advance play_frames into empty space 
-                       and permanently delete upcoming audio data. Yield and wait for ffmpeg. */
+                       and permanently delete upcoming audio data. Yield and wait for JNI. */
                     usleep(1000);
                     continue;
                 }
             }
-
-            __builtin_prefetch(data_ptr + (frames_to_write * ctx->frame_bytes), 0, 3);
-
-            /* Write directly to ALSA in frames */
+            
             snd_pcm_sframes_t written_frames = ALSA_WRITE(ctx->pcm, data_ptr, frames_to_write);
 
             if (unlikely(written_frames < 0)) {
@@ -3001,11 +2908,10 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 if (shm) {
                     atomic_store_explicit(&shm->current_frame, final_acoustic, memory_order_release);
                     
-                    int expected_none = CMD_NONE;
-                    atomic_compare_exchange_strong_explicit(&shm->command, &expected_none, CMD_PAUSE, memory_order_release, memory_order_relaxed);
+                    /* Update state for JNI. Never mutate command channel internally. */
                     atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
                 }
-                
+
                 snd_pcm_close(ctx->pcm);
                 ctx->pcm = NULL;
                 ctx->alsa_fd = -1;
@@ -3328,16 +3234,13 @@ run_player_child(struct cmd *cmd)
     }
 
     /* Apply process optimizations */
-    optimize_process(cmd->cpu_core);
+    optimize_process(cmd->cpu_core);;
     
-    printf("playing '%s': %u ch, %u hz, %u-bit ", cmd->filename, cmd->channels,
-            cmd->rate, snd_pcm_format_physical_width(cmd->format));
-            
-    if (cmd->format == SND_PCM_FORMAT_FLOAT_LE) {
-        printf("floating-point PCM\n");
-    } else {
-        printf("signed PCM\n");
-    }
+    printf("playing raw PCM memfd: %u ch, %u Hz, Format: %s (%u-bit physical)\n", 
+            cmd->channels, 
+            cmd->rate, 
+            snd_pcm_format_name(cmd->format),
+            snd_pcm_format_physical_width(cmd->format));
 
     /* Start the main playback loop */
     int res = play_sample(&ctx, cmd);
@@ -3362,34 +3265,35 @@ cmd_init(struct cmd *cmd)
 
     cmd->channels = 2;
     cmd->rate = 48000;
-    cmd->bits = 16;
+    cmd->format = SND_PCM_FORMAT_S16_LE;
     cmd->cpu_core = -1;
     cmd->shm_file = DEFAULT_SHM_FILE;
     cmd->expected_size = 0;
 
     cmd->usb_uevent_path[0] = '\0';
     cmd->dac_claimed = false;
-    cmd->use_unbind = false; 
+    cmd->use_unbind = false;
+
+    cmd->freq_percent = 60; 
 }
 
 void
 print_usage(const char *argv0)
 {
-    fprintf(stderr, "usage: %s file.wav [options]\n", argv0);
+    fprintf(stderr, "usage: %s /proc/<pid>/fd/<fd> [options]\n", argv0);
     fprintf(stderr, "options:\n");
     fprintf(stderr, "-D | --card   <card number>    The card to receive the audio\n");
     fprintf(stderr, "-d | --device <device number>  The device to receive the audio\n");
     fprintf(stderr, "-p | --period-size <size>      The size of the PCM's period\n");
     fprintf(stderr, "-n | --period-count <count>    The number of PCM periods\n");
-    fprintf(stderr, "-i | --file-type <file-type>   The type of file to read (raw or wav)\n");
     fprintf(stderr, "-c | --channels <count>        The amount of channels per frame\n");
     fprintf(stderr, "-r | --rate <rate>             The amount of frames per second\n");
-    fprintf(stderr, "-b | --bits <bit-count>        The number of bits in one sample\n");
-    fprintf(stderr, "-f | --float                   The frames are in floating-point PCM\n");
+    fprintf(stderr, "-f | --format <format>         Exact ALSA PCM format (e.g., S16_LE, S24_3LE, S24_LE, FLOAT_LE)\n");
+    fprintf(stderr, "-F | --freq-percent <percent>  Target CPU frequency limit (10-100, default: 60)\n");
     fprintf(stderr, "-M | --mmap                    Use memory mapped IO to play audio\n");
     fprintf(stderr, "-C | --cpu-core <core>         Isolate player on specific CPU core\n");
     fprintf(stderr, "-S | --shm <path>              Path to SHM control file\n");
-    fprintf(stderr, "-E | --expected-size <bytes>   Pre-truncate file to this size for instant streaming\n");
+    fprintf(stderr, "-E | --expected-size <bytes>   Pre-allocate memfd limits for instant streaming\n");
     fprintf(stderr, "-s | --start-frame <frame>     Start playback exactly from this frame\n");
     fprintf(stderr, "-U | --use-unbind              Enable exclusive USB DAC access (unbind/bind trick)\n");
 }
@@ -3416,11 +3320,10 @@ main(int argc, char **argv)
         { "device", 'd', OPTPARSE_REQUIRED },
         { "period-size", 'p', OPTPARSE_REQUIRED },
         { "period-count", 'n', OPTPARSE_REQUIRED },
-        { "file-type", 'i', OPTPARSE_REQUIRED },
         { "channels", 'c', OPTPARSE_REQUIRED },
         { "rate", 'r', OPTPARSE_REQUIRED },
-        { "bits", 'b', OPTPARSE_REQUIRED },
-        { "float", 'f', OPTPARSE_NONE },
+        { "format", 'f', OPTPARSE_REQUIRED },
+        { "freq-percent", 'F', OPTPARSE_REQUIRED }, 
         { "mmap", 'M', OPTPARSE_NONE },
         { "cpu-core", 'C', OPTPARSE_REQUIRED },
         { "shm", 'S', OPTPARSE_REQUIRED },
@@ -3452,14 +3355,17 @@ main(int argc, char **argv)
         case 'r':
             sscanf(opts.optarg, "%u", &cmd.rate);
             break;
-        case 'i':
-            cmd.filetype = opts.optarg;
-            break;
-        case 'b':
-            sscanf(opts.optarg, "%u", &cmd.bits);
-            break;
         case 'f':
-            cmd.is_float = true;
+            cmd.format = snd_pcm_format_value(opts.optarg);
+            if (cmd.format == SND_PCM_FORMAT_UNKNOWN) {
+                fprintf(stderr, "Fatal: Unknown ALSA format '%s'\n", opts.optarg);
+                return 1;
+            }
+            break;
+        case 'F':
+            sscanf(opts.optarg, "%d", &cmd.freq_percent);
+            if (cmd.freq_percent < 10) cmd.freq_percent = 10;
+            if (cmd.freq_percent > 100) cmd.freq_percent = 100;
             break;
         case 'M':
             cmd.use_mmap = true;
@@ -3497,7 +3403,7 @@ main(int argc, char **argv)
     acquire_usb_dac(&cmd); 
 
     /* Prepare system state and record current values */
-    precalc_system_state(cmd.cpu_core);
+    precalc_system_state(cmd.cpu_core, cmd.freq_percent);
 
     /* Hardware capabilities are checked inside ctx_init */
 
