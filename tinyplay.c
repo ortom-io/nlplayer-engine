@@ -27,56 +27,49 @@
 ** DAMAGE.
 */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <assert.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdalign.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <stdbool.h>
 #include <string.h>
-#include <signal.h>
-#include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <ctype.h>
-#include <dirent.h>
-#include <sched.h>
 #include <time.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#include <sys/prctl.h>
-#include <sys/mount.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <assert.h>
-#include <stdatomic.h>
+#include <unistd.h>
+
+#include <dirent.h>
+#include <fcntl.h>
 #include <linux/futex.h>
-#include <sys/time.h>
-#include <pthread.h>
-#include <sys/ioctl.h>
-#include <alsa/asoundlib.h>
 #include <sys/eventfd.h>
-#include <poll.h>
 #include <sys/inotify.h>
-#include <limits.h>
-#include <stdalign.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+
+#include <alsa/asoundlib.h>
+
 #include "shm_protocol.h"
-
-
-/* Wrapper for direct system call */
-static long
-sys_futex(void *addr1, int op, int val1, const struct timespec *timeout, void *addr2, int val3)
-{
-    return syscall(SYS_futex, addr1, op, val1, timeout, addr2, val3);
-}
-
-/* Fallback definitions for older headers */
-#ifndef FUTEX_WAIT
-#define FUTEX_WAIT 0
-#endif
-#ifndef FUTEX_WAKE
-#define FUTEX_WAKE 1
-#endif
 
 #define OPTPARSE_IMPLEMENTATION
 #include "optparse.h"
@@ -93,62 +86,13 @@ sys_futex(void *addr1, int op, int val1, const struct timespec *timeout, void *a
 #define SNDRV_PCM_IOCTL_DELAY _IOR('A', 0x21, snd_pcm_sframes_t)
 #endif
 
-/* --- CONFIGURATION --- */
-#define DEFAULT_SHM_FILE "/mnt/nlp/tinyplay_shm"
-#define SHIELD_DIR       "/mnt/nlp/tmp"
-#define MY_BUNKER        "tiny_shield"
-#define MAX_STATE_ENTRIES 2048
-
-static char g_cpuset_root[128] = "/dev/cpuset";
-
-/* Commands & States */
-#define CMD_NONE 0
-#define CMD_PAUSE 1
-#define CMD_RESUME 2
-#define CMD_SEEK 3
-#define CMD_EXIT 4
-#define CMD_UPDATE_TIME 5
-#define STATE_PLAYING 0
-#define STATE_PAUSED 1
-#define STATE_COMPLETED 2
-#define STATE_ERROR 3
-#define STATE_DRAINING 4
-
-/* Priority Defines */
-#ifndef IOPRIO_CLASS_RT
-#define IOPRIO_CLASS_RT 1
-#endif
-#ifndef IOPRIO_WHO_PROCESS
-#define IOPRIO_WHO_PROCESS 1
-#endif
-#ifndef PR_SET_TIMERSLACK
-#define PR_SET_TIMERSLACK 29
+/* Fallback definitions for older headers */
+#ifndef FUTEX_WAIT
+#define FUTEX_WAIT 0
 #endif
 
-#ifndef MS_BIND
-#define MS_BIND 4096
-#endif
-#ifndef MS_REC
-#define MS_REC 16384
-#endif
-#ifndef MS_PRIVATE
-#define MS_PRIVATE (1<<18)
-#endif
-#ifndef MNT_DETACH
-#define MNT_DETACH 2
-#endif
-#ifndef SCHED_BATCH
-#define SCHED_BATCH 3
-#endif
-
-#ifndef IOPRIO_WHO_PROCESS
-#define IOPRIO_WHO_PROCESS 1
-#endif
-#ifndef IOPRIO_CLASS_BE
-#define IOPRIO_CLASS_BE 2
-#endif
-#ifndef IOPRIO_CLASS_IDLE
-#define IOPRIO_CLASS_IDLE 3
+#ifndef FUTEX_WAKE
+#define FUTEX_WAKE 1
 #endif
 
 #ifndef SYS_gettid
@@ -175,13 +119,82 @@ static char g_cpuset_root[128] = "/dev/cpuset";
 #endif
 #endif
 
+/* Priority and scheduling defines */
+#ifndef IOPRIO_WHO_PROCESS
+#define IOPRIO_WHO_PROCESS 1
+#endif
+
+#ifndef IOPRIO_CLASS_RT
+#define IOPRIO_CLASS_RT 1
+#endif
+
+#ifndef IOPRIO_CLASS_BE
+#define IOPRIO_CLASS_BE 2
+#endif
+
+#ifndef IOPRIO_CLASS_IDLE
+#define IOPRIO_CLASS_IDLE 3
+#endif
+
+#ifndef PR_SET_TIMERSLACK
+#define PR_SET_TIMERSLACK 29
+#endif
+
+#ifndef SCHED_BATCH
+#define SCHED_BATCH 3
+#endif
+
+#ifndef MS_BIND
+#define MS_BIND 4096
+#endif
+
+#ifndef MS_REC
+#define MS_REC 16384
+#endif
+
+#ifndef MS_PRIVATE
+#define MS_PRIVATE (1 << 18)
+#endif
+
+#ifndef MNT_DETACH
+#define MNT_DETACH 2
+#endif
+
+/* Wrappers for direct system calls */
+static long
+sys_futex(void *addr1, int op, int val1, const struct timespec *timeout, void *addr2, int val3)
+{
+    return syscall(SYS_futex, addr1, op, val1, timeout, addr2, val3);
+}
+
 static inline pid_t
 sys_gettid(void)
 {
     return syscall(SYS_gettid);
 }
 
+/* --- CONFIGURATION --- */
+#define DEFAULT_SHM_FILE "/mnt/nlp/tinyplay_shm"
+#define SHIELD_DIR       "/mnt/nlp/tmp"
+#define MY_BUNKER        "tiny_shield"
+#define MAX_STATE_ENTRIES 2048
+
+/* Commands & States */
+#define CMD_NONE        0
+#define CMD_PAUSE       1
+#define CMD_RESUME      2
+#define CMD_SEEK        3
+#define CMD_EXIT        4
+#define CMD_UPDATE_TIME 5
+
+#define STATE_PLAYING   0
+#define STATE_PAUSED    1
+#define STATE_COMPLETED 2
+#define STATE_ERROR     3
+#define STATE_DRAINING  4
+
 /* --- GLOBALS --- */
+static char g_cpuset_root[128] = "/dev/cpuset";
 static int g_pm_qos_fd = -1;
 static const char *g_shm_path = DEFAULT_SHM_FILE;
 static pid_t g_child_pid = -1;
@@ -199,8 +212,14 @@ static state_entry_t g_state_cache[MAX_STATE_ENTRIES];
 static int g_state_count = 0;
 
 static struct player_ctrl *shm = NULL;
-volatile atomic_int signal_event = 0;
+static volatile atomic_int signal_event = 0;
 static volatile atomic_int stop_flag = 0;
+
+#define IPC_SOCKET_NAME "nlplayer_shm_ipc"
+#define IPC_SOCKET_LEN (sizeof(sa_family_t) + 1 + strlen(IPC_SOCKET_NAME))
+
+static int g_shm_fd = -1;
+static volatile sig_atomic_t g_child_exited = 0;
 
 /* Standard Structures */
 struct ctx {
@@ -302,7 +321,7 @@ file_exists(const char *path)
 }
 
 /* Remove trailing newline and carriage return */
-void
+static void
 trim_newline(char *str)
 {
     if (!str || !*str)
@@ -392,7 +411,7 @@ release_usb_dac(struct cmd *cmd)
    SYSTEM OPTIMIZATION ENGINE
    ========================================================================= */
 
-bool
+static bool
 is_cpu_in_list(int cpu_idx, const char *list_str)
 {
     if (!list_str || strlen(list_str) == 0)
@@ -418,7 +437,7 @@ is_cpu_in_list(int cpu_idx, const char *list_str)
     return false;
 }
 
-void
+static void
 register_smart(const char *path, const char *val)
 {
     if (!path || !val)
@@ -454,7 +473,7 @@ register_smart(const char *path, const char *val)
     trim_newline(entry->original_val);
 }
 
-void
+static void
 register_change(const char *path, const char *target_val, bool is_mount)
 {
     if (is_mount) {
@@ -474,7 +493,7 @@ register_change(const char *path, const char *target_val, bool is_mount)
     }
 }
 
-void
+static void
 exclude_cpu_from_list(const char *in_str, char *out_buf, size_t out_size, int cpu_to_remove)
 {
     bool cpu_present[256] = { 0 };
@@ -533,7 +552,7 @@ exclude_cpu_from_list(const char *in_str, char *out_buf, size_t out_size, int cp
     }
 }
 
-void
+static void
 precalc_usb_irqs(int cpu_core)
 {
     FILE *fp = fopen("/proc/interrupts", "r");
@@ -599,7 +618,7 @@ precalc_usb_irqs(int cpu_core)
     fclose(fp);
 }
 
-void
+static void
 precalc_sibling_eviction(int cpu_core)
 {
     DIR *d;
@@ -636,7 +655,7 @@ precalc_sibling_eviction(int cpu_core)
     closedir(d);
 }
 
-void
+static void
 detect_cpuset_path(void)
 {
     FILE *fp = fopen("/proc/mounts", "r");
@@ -756,7 +775,7 @@ get_optimal_target_freq(int cpu_core, char *out_freq, size_t out_size, int perce
     snprintf(out_freq, out_size, "%ld", best_freq);
 }
 
-void
+static void
 precalc_system_state(int target_core, int freq_percent)
 {
     g_state_count = 0;
@@ -1133,7 +1152,7 @@ precalc_system_state(int target_core, int freq_percent)
     }
 }
 
-void
+static void
 fast_apply_system_state(void)
 {
     if (g_pm_qos_fd < 0) {
@@ -1172,7 +1191,7 @@ fast_apply_system_state(void)
     }
 }
 
-void
+static void
 fast_revert_system_state(bool full_cleanup, bool is_supervisor)
 {
     char path[128];
@@ -1234,7 +1253,7 @@ fast_revert_system_state(bool full_cleanup, bool is_supervisor)
     }
 }
 
-void
+static void
 create_and_enter_bunker(int cpu_core)
 {
     char path_bunker[128], path_root[128], buf[64], temp[128];
@@ -1336,7 +1355,7 @@ create_and_enter_bunker(int cpu_core)
     }
 }
 
-void
+static void
 optimize_process(int cpu_core)
 {
     mlockall(MCL_CURRENT | MCL_FUTURE);
@@ -1360,7 +1379,7 @@ optimize_process(int cpu_core)
     }
 }
 
-void
+static void
 reset_process_priority(void)
 {
     munlockall();
@@ -1380,7 +1399,7 @@ reset_process_priority(void)
 
 /* --- SIGNALS --- */
 /* Player child signal handler */
-void
+static void
 child_signal_handler(int sig)
 {
     /* Save current thread errno to correctly return -EINTR for ALSA or Futex */
@@ -1403,8 +1422,15 @@ child_signal_handler(int sig)
     errno = saved_errno; 
 }
 
+static void
+sigchld_handler(int sig)
+{
+    (void)sig;
+    g_child_exited = 1;
+}
+
 /* Supervisor signal handler */
-void
+static void
 supervisor_signal_handler(int sig)
 {
     /* Forward signal to the child.
@@ -1414,11 +1440,10 @@ supervisor_signal_handler(int sig)
     }
 }
 
-void
+static void
 setup_child_signals(void)
 {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa)); 
+    struct sigaction sa = {0};
     sa.sa_handler = child_signal_handler;
     sa.sa_flags = 0;
     sigemptyset(&sa.sa_mask); 
@@ -1741,24 +1766,15 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
     return 0;
 }
 
-void
-init_shm(uint64_t total_frames, struct cmd *cmd)
+static void
+init_shm(uint64_t total_frames, const struct cmd *cmd)
 {
-    const char *shm_path = cmd ? cmd->shm_file : g_shm_path;
-    
-    /* Attempt to open without O_CREAT first for safe cross-namespace symlink resolution */
-    int fd = open(shm_path, O_RDWR | O_CLOEXEC);
-    if (fd < 0)
-        fd = open(shm_path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
-    
-    if (fd < 0)
+    /* Fallback in case supervisor failed to provide a valid file descriptor */
+    if (g_shm_fd < 0) {
         return;
+    }
 
-    /* Removed F_SETLK to prevent EACCES/ENOLCK across namespaces */
-    fchmod(fd, 0666); 
-    ftruncate(fd, sizeof(struct player_ctrl));
-    
-    shm = mmap(NULL, sizeof(struct player_ctrl), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+    shm = mmap(NULL, sizeof(struct player_ctrl), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, g_shm_fd, 0);
     
     if (shm != MAP_FAILED) {
         /* Verify if SHM was initialized externally */
@@ -1799,10 +1815,13 @@ init_shm(uint64_t total_frames, struct cmd *cmd)
             }
         }
         atomic_thread_fence(memory_order_seq_cst);
+        
+        /* Note: IPC thread creation is intentionally omitted here.
+           It runs exclusively in the supervisor process. */
     }
 }
 
-void
+static void
 ctx_free(struct ctx *ctx)
 {
     if (ctx->pcm)
@@ -1906,7 +1925,7 @@ evict_thread_from_rt_core(int rt_core, bool is_warmer)
 struct watcher_args {
     pthread_t main_tid;
     struct ctx *ctx;
-    struct cmd *cmd;
+    const struct cmd *cmd;
     int cmd_efd;
 };
 
@@ -2003,8 +2022,10 @@ memory_warmer_thread(void *arg)
                    Since memfd is RAM-backed, this isolates the RT thread from 
                    kernel MMU spinlocks completely. */
                 if (warmed_offset < available_size) {
-                    /* Trace memory prefetching throughput to ensure it outpaces DAC consumption */
-                    while (warmed_offset < available_size && !atomic_load(&stop_flag)) {
+                    /* Trace memory prefetching throughput to ensure it outpaces DAC consumption.
+                       Using memory_order_relaxed prevents ARM 'DMB ISH' hardware barriers 
+                       from thrashing the memory bus during tight loop execution. */
+                    while (warmed_offset < available_size && !atomic_load_explicit(&stop_flag, memory_order_relaxed)) {
                         __asm__ __volatile__ ("" : : "r" (ctx->map_start[warmed_offset]) : "memory");
                         warmed_offset += page_size;
                     }
@@ -2034,7 +2055,7 @@ memory_warmer_thread(void *arg)
 
 /* Smooth volume fade (fade-in or fade-out) */
 static void
-apply_fade(uint8_t *buffer, size_t frames, struct cmd *cmd, bool is_fade_in)
+apply_fade(uint8_t *__restrict__ buffer, size_t frames, const struct cmd *__restrict__ cmd, bool is_fade_in)
 {
     if (!buffer || frames == 0)
         return;
@@ -2042,7 +2063,7 @@ apply_fade(uint8_t *buffer, size_t frames, struct cmd *cmd, bool is_fade_in)
     int phys_width = snd_pcm_format_physical_width(cmd->format);
 
     if (cmd->format == SND_PCM_FORMAT_FLOAT_LE) {
-        float *samples = (float *)buffer;
+        float *__restrict__ samples = (float *)buffer;
         
         /* FPU optimization: multiply by inverse to avoid division in the loop */
         const float inv_frames = 1.0f / (float)frames;
@@ -2057,7 +2078,7 @@ apply_fade(uint8_t *buffer, size_t frames, struct cmd *cmd, bool is_fade_in)
                 samples[i * cmd->channels + c] *= vol_sq;
         }
     } else if (cmd->format == SND_PCM_FORMAT_FLOAT64_LE) {
-        double *samples = (double *)buffer;
+        double *__restrict__ samples = (double *)buffer;
         const double inv_frames = 1.0 / (double)frames;
         
         for (size_t i = 0; i < frames; i++) {
@@ -2075,7 +2096,7 @@ apply_fade(uint8_t *buffer, size_t frames, struct cmd *cmd, bool is_fade_in)
         uint64_t vol_accum = 0;
 
         if (phys_width == 16) {
-            int16_t *samples = (int16_t *)buffer;
+            int16_t *__restrict__ samples = (int16_t *)buffer;
             for (size_t i = 0; i < frames; i++) {
                 uint32_t base_vol = vol_accum >> 16;
                 vol_accum += vol_step;
@@ -2089,7 +2110,7 @@ apply_fade(uint8_t *buffer, size_t frames, struct cmd *cmd, bool is_fade_in)
                 }
             }
         } else if (cmd->format == SND_PCM_FORMAT_S32_LE) {
-            int32_t *samples = (int32_t *)buffer;
+            int32_t *__restrict__ samples = (int32_t *)buffer;
             for (size_t i = 0; i < frames; i++) {
                 uint32_t base_vol = vol_accum >> 16;
                 vol_accum += vol_step;
@@ -2103,7 +2124,7 @@ apply_fade(uint8_t *buffer, size_t frames, struct cmd *cmd, bool is_fade_in)
                 }
             }
         } else if (cmd->format == SND_PCM_FORMAT_S24_LE) {
-            int32_t *samples = (int32_t *)buffer;
+            int32_t *__restrict__ samples = (int32_t *)buffer;
             for (size_t i = 0; i < frames; i++) {
                 uint32_t base_vol = vol_accum >> 16;
                 vol_accum += vol_step;
@@ -2123,7 +2144,7 @@ apply_fade(uint8_t *buffer, size_t frames, struct cmd *cmd, bool is_fade_in)
                 }
             }
         } else if (phys_width == 24) {
-            uint8_t *samples = (uint8_t *)buffer;
+            uint8_t *__restrict__ samples = (uint8_t *)buffer;
             for (size_t i = 0; i < frames; i++) {
                 uint32_t base_vol = vol_accum >> 16;
                 vol_accum += vol_step;
@@ -2150,7 +2171,7 @@ apply_fade(uint8_t *buffer, size_t frames, struct cmd *cmd, bool is_fade_in)
 
 /* Safely queries the ALSA hardware delay in frames via direct kernel bypass. */
 static long
-get_safe_alsa_delay(struct ctx *ctx, struct cmd *cmd)
+get_safe_alsa_delay(struct ctx *ctx, const struct cmd *cmd)
 {
     if (!ctx || ctx->alsa_fd < 0 || !cmd)
         return 0;
@@ -2224,7 +2245,7 @@ update_sync_base(struct ctx *ctx, size_t silence_frames)
 }
 
 /* --- PLAYBACK LOOP (CHILD) --- */
-int play_sample(struct ctx *ctx, struct cmd *cmd);
+static int play_sample(struct ctx *ctx, struct cmd *cmd);
 
 /* Player internal states */
 typedef enum {
@@ -2238,7 +2259,7 @@ typedef enum {
     SM_DRAINING
 } player_sm_state_t;
 
-int
+static int
 play_sample(struct ctx *ctx, struct cmd *cmd)
 {
 #define ALSA_WRITE(pcm, buf, size) \
@@ -3205,6 +3226,12 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     /* Graceful shutdown */
     atomic_store(&stop_flag, 1);
     
+    /* IPC thread is handled by the supervisor, only close the descriptor locally */
+    if (g_shm_fd >= 0) {
+        close(g_shm_fd);
+        g_shm_fd = -1;
+    }
+    
     atomic_store_explicit(&shm->command, CMD_EXIT, memory_order_release);
     sys_futex((int *)&shm->command, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
     
@@ -3219,7 +3246,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     return 0;
 }
 
-int
+static int
 run_player_child(struct cmd *cmd)
 {
     struct ctx ctx;
@@ -3234,7 +3261,7 @@ run_player_child(struct cmd *cmd)
     }
 
     /* Apply process optimizations */
-    optimize_process(cmd->cpu_core);;
+    optimize_process(cmd->cpu_core);
     
     printf("playing raw PCM memfd: %u ch, %u Hz, Format: %s (%u-bit physical)\n", 
             cmd->channels, 
@@ -3251,7 +3278,7 @@ run_player_child(struct cmd *cmd)
     return res;
 }
 
-void
+static void
 cmd_init(struct cmd *cmd)
 {
     memset(cmd, 0, sizeof(struct cmd));
@@ -3277,7 +3304,7 @@ cmd_init(struct cmd *cmd)
     cmd->freq_percent = 60; 
 }
 
-void
+static void
 print_usage(const char *argv0)
 {
     fprintf(stderr, "usage: %s /proc/<pid>/fd/<fd> [options]\n", argv0);
@@ -3407,7 +3434,22 @@ main(int argc, char **argv)
 
     /* Hardware capabilities are checked inside ctx_init */
 
-    /* Fork process */
+    /* Open SHM file before forking so the child inherits the file descriptor.
+       We do NOT start the IPC thread yet to avoid POSIX fork-safety hazards
+       (deadlocks from inherited locked mutexes in a multi-threaded fork). */
+    const char *shm_path = cmd.shm_file ? cmd.shm_file : g_shm_path;
+    
+    g_shm_fd = open(shm_path, O_RDWR | O_CLOEXEC);
+    if (g_shm_fd < 0) {
+        g_shm_fd = open(shm_path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    }
+    
+    if (g_shm_fd >= 0) {
+        fchmod(g_shm_fd, 0666); 
+        ftruncate(g_shm_fd, sizeof(struct player_ctrl));
+    }
+
+    /* Fork process strictly as a single-threaded application */
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork failed");
@@ -3433,30 +3475,139 @@ main(int argc, char **argv)
         prctl(PR_SET_NAME, DaemonName, 0, 0, 0);
 
         /* Setup signals: catch TERM/INT and forward to child */
-        struct sigaction sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = supervisor_signal_handler;
-        
-        /* Omit SA_RESTART to allow waitpid interruption */
-        sigaction(SIGINT, &sa, NULL); 
-        sigaction(SIGTERM, &sa, NULL);
+        struct sigaction sa_int = {0};
+        sa_int.sa_handler = supervisor_signal_handler;
+        sigaction(SIGINT, &sa_int, NULL); 
+        sigaction(SIGTERM, &sa_int, NULL);
 
+        /* Catch SIGCHLD to monitor child termination without blocking */
+        struct sigaction sa_chld = {0};
+        sa_chld.sa_handler = sigchld_handler;
+        /* SA_NOCLDSTOP prevents waking up if the child is merely suspended */
+        sa_chld.sa_flags = SA_NOCLDSTOP;
+        sigaction(SIGCHLD, &sa_chld, NULL);
+
+        /* Block SIGCHLD to prevent race conditions before entering ppoll */
+        sigset_t block_mask, orig_mask;
+        sigemptyset(&block_mask);
+        sigaddset(&block_mask, SIGCHLD);
+        sigprocmask(SIG_BLOCK, &block_mask, &orig_mask);
+
+        /* Initialize local IPC server socket */
+        uid_t app_owner_uid = 0;
+        struct stat st;
+        if (fstat(g_shm_fd, &st) == 0) {
+            app_owner_uid = st.st_uid;
+        }
+
+        int server_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (server_fd >= 0) {
+            struct sockaddr_un addr = {0};
+            addr.sun_family = AF_UNIX;
+            /* Using Abstract Socket Namespace (starts with \0). 
+               Auto-cleaned by the kernel, no unlink() needed. */
+            memcpy(&addr.sun_path[1], IPC_SOCKET_NAME, strlen(IPC_SOCKET_NAME));
+
+            if (bind(server_fd, (struct sockaddr *)&addr, IPC_SOCKET_LEN) == 0) {
+                listen(server_fd, 5);
+            } else {
+                close(server_fd);
+                server_fd = -1;
+            }
+        }
+
+        /* --- THE GOD-TIER EVENT LOOP --- */
         int status = 0;
-        
-        /* Protect waitpid against premature EINTR exits */
-        int ret;
-        do {
-            ret = waitpid(pid, &status, 0);
-        } while (ret == -1 && errno == EINTR);
+        bool child_reaped = false;
+        struct pollfd pfd = { .fd = server_fd, .events = POLLIN, .revents = 0 };
+
+        while (!g_child_exited) {
+            /* ppoll atomically replaces the signal mask with orig_mask (where SIGCHLD
+               is unblocked), sleeps, and restores block_mask upon waking up. */
+            int ret = ppoll((server_fd >= 0) ? &pfd : NULL, (server_fd >= 0) ? 1 : 0, NULL, &orig_mask);
+
+            if (ret < 0) {
+                if (errno == EINTR) {
+                    /* Interrupted by signal. Check if the child has died. */
+                    if (g_child_exited) {
+                        /* WNOHANG guarantees we won't block if it was a false alarm */
+                        if (waitpid(pid, &status, WNOHANG) > 0) {
+                            child_reaped = true;
+                        }
+                    }
+                    continue;
+                }
+                break;
+            }
+
+            /* Handle incoming IPC connection */
+            if (ret > 0 && (pfd.revents & POLLIN)) {
+                /* SOCK_NONBLOCK protects supervisor from stalling if client hangs on recvmsg */
+                int client_fd = accept4(server_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+                
+                if (client_fd >= 0) {
+                    struct ucred credentials;
+                    socklen_t ucred_length = sizeof(struct ucred);
+                    
+                    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &credentials, &ucred_length) == 0) {
+                        uid_t peer_uid = credentials.uid;
+                        
+                        if (peer_uid == 0 || peer_uid == app_owner_uid) {
+                            struct msghdr msg = {0};
+
+                            char m_buffer[1] = { 'F' };
+                            struct iovec io = { .iov_base = m_buffer, .iov_len = sizeof(m_buffer) };
+                            msg.msg_iov = &io;
+                            msg.msg_iovlen = 1;
+
+                            union {
+                                char buf[CMSG_SPACE(sizeof(int))];
+                                struct cmsghdr align;
+                            } u = {0};
+
+                            msg.msg_control = u.buf;
+                            msg.msg_controllen = sizeof(u.buf);
+
+                            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+                            cmsg->cmsg_level = SOL_SOCKET;
+                            cmsg->cmsg_type = SCM_RIGHTS;
+                            cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+
+                            memcpy(CMSG_DATA(cmsg), &g_shm_fd, sizeof(int));
+
+                            sendmsg(client_fd, &msg, MSG_NOSIGNAL);
+                        }
+                    }
+                    close(client_fd);
+                }
+            }
+        }
+
+        /* Fallback: reap child if ppoll exited but waitpid wasn't called */
+        if (!child_reaped) {
+            int ret;
+            do {
+                ret = waitpid(pid, &status, 0);
+            } while (ret == -1 && errno == EINTR);
+        }
 
         /* --- CLEANUP ZONE --- */
         /* This code executes unconditionally upon child termination */
+
+        if (server_fd >= 0) {
+            close(server_fd);
+        }
+
+        if (g_shm_fd >= 0) {
+            close(g_shm_fd);
+            g_shm_fd = -1;
+        }
 
         /* Release USB DAC */
         release_usb_dac(&cmd); 
         
         fast_revert_system_state(true, true); 
-        unlink(g_shm_path);
+        unlink(shm_path);
 
         /* Return correct exit code */
         if (WIFSIGNALED(status))
@@ -3468,6 +3619,7 @@ main(int argc, char **argv)
 
     } else {
         /* --- WORKER (PLAYER) --- */
+        
         prctl(PR_SET_NAME, "tinyplay", 0, 0, 0);
         
         /* Start core logic. System cleanup is handled by the parent supervisor. */
