@@ -2337,17 +2337,12 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         fprintf(stderr, "Fatal: Failed to allocate aligned silence buffer\n");
         return 1;
     }
-    snd_pcm_format_set_silence(cmd->format, silence_buf, cmd->period_size * cmd->channels);
-    if (!silence_buf) {
-        fprintf(stderr, "Fatal: Failed to allocate silence buffer\n");
-        ctx_free(ctx);
-        return 1;
-    }
 
     /* Calculate dynamic fade duration */
     size_t optimal_fade_frames = (cmd->rate * 50) / 1000; 
-    if (optimal_fade_frames < 64)
+    if (optimal_fade_frames < 64) {
         optimal_fade_frames = 64;
+    }
 
     /* Preallocate buffer for realtime fades */
     size_t max_rt_frames = optimal_fade_frames * 2; 
@@ -2361,19 +2356,19 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         return 1;
     }
 
-    /* Lock allocated memory pages */
-    mlock(silence_buf, max_period_bytes);
-    mlock(rt_fade_buf, max_rt_frames * ctx->frame_bytes);
+    /* Allocate stack memory ONCE for the entire track lifecycle */
+    snd_pcm_hw_params_t *hwp;
+    snd_pcm_sw_params_t *swp;
+    snd_pcm_hw_params_alloca(&hwp);
+    snd_pcm_sw_params_alloca(&swp);
 
+    /* Pre-faulting: force kernel to allocate physical pages BEFORE mlock */
     snd_pcm_format_set_silence(cmd->format, silence_buf, cmd->period_size * cmd->channels);
     snd_pcm_format_set_silence(cmd->format, rt_fade_buf, max_rt_frames * cmd->channels);
-    
-    if (!rt_fade_buf) {
-        fprintf(stderr, "Fatal: Failed to allocate RT fade buffer\n");
-        free(silence_buf);
-        ctx_free(ctx);
-        return 1;
-    }
+
+    /* Lock allocated memory pages into RAM */
+    mlock(silence_buf, max_period_bytes);
+    mlock(rt_fade_buf, max_rt_frames * ctx->frame_bytes);
 
     /* DAC warm-up */
     if (ctx->pcm) {
@@ -2539,33 +2534,30 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                                 snd_pcm_prepare(ctx->pcm);
 
                                 size_t period_frames = cmd->period_size;
-                                snd_pcm_format_set_silence(cmd->format, rt_fade_buf, period_frames * cmd->channels);
 
-                                /* Prepend hardware silence before real audio to stabilize 
-                                   DAC voltage and prevent amplifier pop noises. */
-                                size_t silence_frames = 512;
-                                if (silence_frames > period_frames)
-                                    silence_frames = period_frames;
-                                size_t audio_frames = period_frames - silence_frames;
-
+                                size_t audio_frames = period_frames;
                                 size_t avail_new = (live_frames > target_frames) ? (live_frames - target_frames) : 0;
-                                if (audio_frames > avail_new)
+
+                                if (audio_frames > avail_new) {
                                     audio_frames = avail_new;
+                                }
 
                                 if (audio_frames > 0) {
                                     uint8_t *data_ptr = ctx->data_start + (target_frames * ctx->frame_bytes);
-                                    memcpy(rt_fade_buf + (silence_frames * ctx->frame_bytes), data_ptr, audio_frames * ctx->frame_bytes);
+                                    memcpy(rt_fade_buf, data_ptr, audio_frames * ctx->frame_bytes);
+                                    
                                     size_t fi_frames = optimal_fade_frames;
-                                    if (fi_frames > audio_frames)
+                                    if (fi_frames > audio_frames) {
                                         fi_frames = audio_frames;
-                                    apply_fade(rt_fade_buf + (silence_frames * ctx->frame_bytes), fi_frames, cmd, true);
+                                    }
+                                    apply_fade(rt_fade_buf, fi_frames, cmd, true);
                                 }
 
                                 snd_pcm_sframes_t written = 0;
-                                if (silence_frames + audio_frames > 0) {
+                                if (audio_frames > 0) {
                                     int retries = 0;
                                     do {
-                                        written = ALSA_WRITE(ctx->pcm, rt_fade_buf, silence_frames + audio_frames);
+                                        written = ALSA_WRITE(ctx->pcm, rt_fade_buf, audio_frames);
                                         if (written == -EAGAIN) {
                                             /* Yield to eventfd to prevent hot polling */
                                             wait_for_alsa_or_command(ctx, cmd_efd, 2); 
@@ -2579,12 +2571,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                                     }
                                 }
 
-                                long actual_written_audio = 0;
-                                if (written > 0) {
-                                    actual_written_audio = written - silence_frames;
-                                    if (actual_written_audio < 0)
-                                        actual_written_audio = 0;
-                                }
+                                long actual_written_audio = (written > 0) ? written : 0;
 
                                 ctx->play_frames = target_frames + actual_written_audio;
                                 update_sync_base(ctx, 0);
@@ -2973,13 +2960,22 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
             /* State: SM_RESUMING (Wake up and fade-in) */
             int chk_cmd = atomic_load_explicit(&shm->command, memory_order_acquire);
             if (chk_cmd == CMD_PAUSE) {
-                fade_is_exit = false;
-                sm_state = SM_FADING_OUT_INIT;
+                if (ctx->pcm) {
+                    fade_is_exit = false;
+                    sm_state = SM_FADING_OUT_INIT;
+                } else {
+                    sm_state = SM_SLEEPING;
+                }
                 break;
             }
+
             if (chk_cmd == CMD_EXIT) {
-                fade_is_exit = true;
-                sm_state = SM_FADING_OUT_INIT;
+                if (ctx->pcm) {
+                    fade_is_exit = true;
+                    sm_state = SM_FADING_OUT_INIT;
+                } else {
+                    atomic_store(&stop_flag, 1);
+                }
                 break;
             }
 
@@ -2992,61 +2988,65 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 snprintf(dev_name, sizeof(dev_name), "hw:%u,%u", cmd->card, cmd->device);
                 
                 int open_mode = SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT | SND_PCM_NO_SOFTVOL | SND_PCM_NONBLOCK;
-                if (snd_pcm_open(&ctx->pcm, dev_name, SND_PCM_STREAM_PLAYBACK, open_mode) == 0) {
-                    snd_pcm_hw_params_t *hwp;
-                    snd_pcm_hw_params_alloca(&hwp);
-                    snd_pcm_hw_params_any(ctx->pcm, hwp);
-                    
-                    snd_pcm_access_t access = cmd->use_mmap ? SND_PCM_ACCESS_MMAP_INTERLEAVED : SND_PCM_ACCESS_RW_INTERLEAVED;
-                    snd_pcm_hw_params_set_access(ctx->pcm, hwp, access);
-                    
-                    snd_pcm_hw_params_set_format(ctx->pcm, hwp, cmd->format);
-                    snd_pcm_hw_params_set_channels(ctx->pcm, hwp, cmd->channels);
-                    snd_pcm_hw_params_set_rate_resample(ctx->pcm, hwp, 0);
-                    snd_pcm_hw_params_set_rate(ctx->pcm, hwp, cmd->rate, 0);
-                    
-                    snd_pcm_uframes_t req_buf = cmd->period_size * cmd->period_count;
-                    snd_pcm_hw_params_set_buffer_size_near(ctx->pcm, hwp, &req_buf);
-                    
-                    snd_pcm_uframes_t req_per = cmd->period_size;
-                    int dir = 0;
-                    snd_pcm_hw_params_set_period_size_near(ctx->pcm, hwp, &req_per, &dir);
-                    snd_pcm_hw_params(ctx->pcm, hwp);
-
-                    snd_pcm_sw_params_t *swp;
-                    snd_pcm_sw_params_alloca(&swp);
-                    snd_pcm_sw_params_current(ctx->pcm, swp);
-                    snd_pcm_sw_params_set_avail_min(ctx->pcm, swp, cmd->period_size);
-                    snd_pcm_sw_params_set_start_threshold(ctx->pcm, swp, req_buf);
-                    
-                    snd_pcm_sw_params_set_stop_threshold(ctx->pcm, swp, req_buf);
-                    snd_pcm_sw_params_set_tstamp_mode(ctx->pcm, swp, SND_PCM_TSTAMP_NONE);
-                    
-                    snd_pcm_sw_params(ctx->pcm, swp);
-                    snd_pcm_prepare(ctx->pcm);
-
-                    ctx->alsa_fd = -1;
-                    int count = snd_pcm_poll_descriptors_count(ctx->pcm);
-                    if (count >= 1 && count < 16) {
-                        struct pollfd pfds[16];
-                        if (snd_pcm_poll_descriptors(ctx->pcm, pfds, count) == count) {
-                            ctx->alsa_fd = pfds[0].fd;
-                        }
-                    }
-                }
+                snd_pcm_open(&ctx->pcm, dev_name, SND_PCM_STREAM_PLAYBACK, open_mode);
             }
 
             if (ctx->pcm) {
-                /* Soft start sequence */
-                size_t period_frames = cmd->period_size;
-                snd_pcm_format_set_silence(cmd->format, rt_fade_buf, period_frames * cmd->channels);
-
-                size_t silence_frames = 512; 
-                if (silence_frames > period_frames)
-                    silence_frames = period_frames;
+                bool setup_ok = false;
                 
-                size_t audio_frames = period_frames - silence_frames;
+                snd_pcm_hw_params_any(ctx->pcm, hwp);
+                
+                snd_pcm_access_t access = cmd->use_mmap ? SND_PCM_ACCESS_MMAP_INTERLEAVED : SND_PCM_ACCESS_RW_INTERLEAVED;
+                if (snd_pcm_hw_params_set_access(ctx->pcm, hwp, access) < 0) {
+                    cmd->use_mmap = false;
+                    snd_pcm_hw_params_set_access(ctx->pcm, hwp, SND_PCM_ACCESS_RW_INTERLEAVED);
+                }
+                
+                snd_pcm_hw_params_set_format(ctx->pcm, hwp, cmd->format);
+                snd_pcm_hw_params_set_channels(ctx->pcm, hwp, cmd->channels);
+                snd_pcm_hw_params_set_rate_resample(ctx->pcm, hwp, 0);
+                snd_pcm_hw_params_set_rate(ctx->pcm, hwp, cmd->rate, 0);
+                
+                snd_pcm_uframes_t req_buf = cmd->period_size * cmd->period_count;
+                snd_pcm_hw_params_set_buffer_size_near(ctx->pcm, hwp, &req_buf);
+                
+                snd_pcm_uframes_t req_per = cmd->period_size;
+                int dir = 0;
+                snd_pcm_hw_params_set_period_size_near(ctx->pcm, hwp, &req_per, &dir);
+                
+                if (snd_pcm_hw_params(ctx->pcm, hwp) == 0) {
+                    snd_pcm_sw_params_current(ctx->pcm, swp);
+                    snd_pcm_sw_params_set_avail_min(ctx->pcm, swp, cmd->period_size);
+                    snd_pcm_sw_params_set_start_threshold(ctx->pcm, swp, req_buf);
+                    snd_pcm_sw_params_set_stop_threshold(ctx->pcm, swp, req_buf);
+                    snd_pcm_sw_params_set_tstamp_mode(ctx->pcm, swp, SND_PCM_TSTAMP_NONE);
+                    
+                    if (snd_pcm_sw_params(ctx->pcm, swp) == 0 && snd_pcm_prepare(ctx->pcm) == 0) {
+                        setup_ok = true;
+                    }
+                }
 
+                if (!setup_ok) {
+                    snd_pcm_close(ctx->pcm);
+                    ctx->pcm = NULL;
+                    ctx->alsa_fd = -1;
+                    
+                    struct pollfd pfd = { .fd = cmd_efd, .events = POLLIN, .revents = 0 };
+                    poll(&pfd, 1, 10);
+                    break;
+                }
+
+                ctx->alsa_fd = -1;
+                int count = snd_pcm_poll_descriptors_count(ctx->pcm);
+                if (count >= 1 && count < 16) {
+                    struct pollfd pfds[16];
+                    if (snd_pcm_poll_descriptors(ctx->pcm, pfds, count) == count) {
+                        ctx->alsa_fd = pfds[0].fd;
+                    }
+                }
+
+                /* Soft start sequence */
+                size_t audio_frames = cmd->period_size;
                 size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
                 size_t avail_frames = (live_frames > ctx->play_frames) ? (live_frames - ctx->play_frames) : 0;
                 
@@ -3056,15 +3056,17 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
 
                 if (audio_frames > 0) {
                     uint8_t *data_ptr = ctx->data_start + (ctx->play_frames * ctx->frame_bytes);
-                    memcpy(rt_fade_buf + (silence_frames * ctx->frame_bytes), data_ptr, audio_frames * ctx->frame_bytes);
+                    memcpy(rt_fade_buf, data_ptr, audio_frames * ctx->frame_bytes);
+                    
                     size_t fi_frames = optimal_fade_frames;
-                    if (fi_frames > audio_frames)
+                    if (fi_frames > audio_frames) {
                         fi_frames = audio_frames;
-                    apply_fade(rt_fade_buf + (silence_frames * ctx->frame_bytes), fi_frames, cmd, true);
-                }
+                    }
+                    
+                    apply_fade(rt_fade_buf, fi_frames, cmd, true);
 
-                if (silence_frames + audio_frames > 0) {
-                    if (ALSA_WRITE(ctx->pcm, rt_fade_buf, silence_frames + audio_frames) < 0) {
+                    if (ALSA_WRITE(ctx->pcm, rt_fade_buf, audio_frames) < 0) {
+                        /* Ignore initial soft start errors. Handled by XRUN logic in SM_PLAYING */
                     }
                 }
 
@@ -3077,11 +3079,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 
                 sm_state = SM_PLAYING;
             } else {
-                if (ctx->pcm) {
-                    snd_pcm_close(ctx->pcm); 
-                    ctx->pcm = NULL; 
-                }
-                
+                /* Hardware initialization failed. Sleep briefly and retry */
                 struct pollfd pfd = { .fd = cmd_efd, .events = POLLIN, .revents = 0 };
                 poll(&pfd, 1, 10);
                 
@@ -3096,8 +3094,9 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     }
                 }
                 
-                if (atomic_load(&stop_flag))
+                if (atomic_load(&stop_flag)) {
                     break;
+                }
             }
             break;
         }
