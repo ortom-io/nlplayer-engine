@@ -501,9 +501,15 @@ static void
 register_change(const char *path, const char *target_val, bool is_mount)
 {
     if (is_mount) {
-        if (g_state_count >= MAX_STATE_ENTRIES)
+        if (!path || !target_val || !file_exists(path) || g_state_count >= MAX_STATE_ENTRIES)
             return;
-        
+
+        /* Check for duplicates */
+        for (int i = 0; i < g_state_count; i++) {
+            if (strcmp(g_state_cache[i].path, path) == 0)
+                return;
+        }
+
         state_entry_t *entry = &g_state_cache[g_state_count++];
         
         snprintf(entry->path, sizeof(entry->path), "%s", path);
@@ -1851,6 +1857,9 @@ init_shm(uint64_t total_frames, const struct cmd *cmd)
         
         /* Note: IPC thread creation is intentionally omitted here.
            It runs exclusively in the supervisor process. */
+    } else {
+        perror("Failed to mmap SHM");
+        shm = NULL;
     }
 }
 
@@ -2395,6 +2404,67 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     if (shm)
         atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
 
+    /* Calculate dynamic fade duration strictly snapped to RAM page boundary */
+    size_t optimal_fade_frames = (cmd->rate * 50) / 1000; 
+    if (optimal_fade_frames < 64) {
+        optimal_fade_frames = 64;
+    }
+    
+    if (page_frames > 0 && page_frames <= chunk_frames / 2) {
+        optimal_fade_frames = ((optimal_fade_frames + (page_frames / 2)) / page_frames) * page_frames;
+        if (optimal_fade_frames == 0) {
+            optimal_fade_frames = page_frames;
+        }
+    } else {
+        optimal_fade_frames = ((optimal_fade_frames + cache_frames - 1) / cache_frames) * cache_frames;
+    }
+
+    /* Preallocate silence buffer BEFORE spawning threads and entering RT mode */
+    size_t max_period_bytes = cmd->period_size * ctx->frame_bytes;
+    void *silence_buf = NULL;
+    if (posix_memalign(&silence_buf, 64, max_period_bytes) != 0) {
+        fprintf(stderr, "Fatal: Failed to allocate aligned silence buffer\n");
+        if (shm)
+            atomic_store_explicit(&shm->state, STATE_ERROR, memory_order_release);
+        if (g_shm_fd >= 0) {
+            close(g_shm_fd);
+            g_shm_fd = -1;
+        }
+        return 1;
+    }
+
+    /* Preallocate buffer for realtime fades and final period padding */
+    size_t max_rt_frames = optimal_fade_frames * 2; 
+    if (chunk_frames > max_rt_frames) {
+        max_rt_frames = chunk_frames;
+    }
+    uint8_t *rt_fade_buf = NULL;
+    if (posix_memalign((void **)&rt_fade_buf, 64, max_rt_frames * ctx->frame_bytes) != 0) {
+        fprintf(stderr, "Fatal: Failed to allocate aligned RT fade buffer\n");
+        free(silence_buf);
+        if (shm)
+            atomic_store_explicit(&shm->state, STATE_ERROR, memory_order_release);
+        if (g_shm_fd >= 0) {
+            close(g_shm_fd);
+            g_shm_fd = -1;
+        }
+        return 1;
+    }
+
+    /* Allocate stack memory ONCE and pre-fault heap buffers before mlockall() */
+    snd_pcm_hw_params_t *hwp;
+    snd_pcm_sw_params_t *swp;
+    snd_pcm_hw_params_alloca(&hwp);
+    snd_pcm_sw_params_alloca(&swp);
+
+    /* Pre-faulting: force kernel to allocate physical pages BEFORE mlock */
+    snd_pcm_format_set_silence(cmd->format, silence_buf, cmd->period_size * cmd->channels);
+    snd_pcm_format_set_silence(cmd->format, rt_fade_buf, max_rt_frames * cmd->channels);
+
+    /* Lock allocated memory pages into RAM */
+    mlock(silence_buf, max_period_bytes);
+    mlock(rt_fade_buf, max_rt_frames * ctx->frame_bytes);
+
     /* Start background services */
     int cmd_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
@@ -2406,13 +2476,17 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     
     int expected_bg_threads = 0;
     pthread_t watcher_tid, warmer_tid;
+    bool watcher_started = false;
+    bool warmer_started = false;
     
-    if (pthread_create(&watcher_tid, NULL, shm_watcher_thread, &wargs) == 0) {
+    if (shm && pthread_create(&watcher_tid, NULL, shm_watcher_thread, &wargs) == 0) {
+        watcher_started = true;
         expected_bg_threads++;
     }
     
     if (cmd->expected_size > 0) {
         if (pthread_create(&warmer_tid, NULL, memory_warmer_thread, ctx) == 0) {
+            warmer_started = true;
             expected_bg_threads++;
         }
     }
@@ -2423,8 +2497,9 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         sched_yield();
     }
 
-    /* Enter RT bunker AFTER spawning background threads so they never inherit SCHED_FIFO 99 */
+    /* Enter RT bunker AFTER spawning background threads and locking all buffers */
     optimize_process(cmd->cpu_core);
+    bool sys_isolated = true;
 
     int timeout_ms = ((cmd->period_size * 1000) + cmd->rate - 1) / cmd->rate + 20;
     
@@ -2445,56 +2520,6 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     long target_max_acoustic = 0;
     size_t fade_read_frames = 0;
 
-    /* Preallocate silence buffer */
-    size_t max_period_bytes = cmd->period_size * ctx->frame_bytes;
-    void *silence_buf = NULL;
-    if (posix_memalign(&silence_buf, 64, max_period_bytes) != 0) {
-        fprintf(stderr, "Fatal: Failed to allocate aligned silence buffer\n");
-        return 1;
-    }
-
-    /* Calculate dynamic fade duration strictly snapped to RAM page boundary */
-    size_t optimal_fade_frames = (cmd->rate * 50) / 1000; 
-    if (optimal_fade_frames < 64) {
-        optimal_fade_frames = 64;
-    }
-    
-    if (page_frames > 0 && page_frames <= chunk_frames / 2) {
-        optimal_fade_frames = ((optimal_fade_frames + (page_frames / 2)) / page_frames) * page_frames;
-        if (optimal_fade_frames == 0) {
-            optimal_fade_frames = page_frames;
-        }
-    } else {
-        optimal_fade_frames = ((optimal_fade_frames + cache_frames - 1) / cache_frames) * cache_frames;
-    }
-
-    /* Preallocate buffer for realtime fades and final period padding */
-    size_t max_rt_frames = optimal_fade_frames * 2; 
-    /* Use chunk_frames as it contains safe hardware-validated limits */
-    if (chunk_frames > max_rt_frames) {
-        max_rt_frames = chunk_frames;
-    }
-    uint8_t *rt_fade_buf = NULL;
-    if (posix_memalign((void **)&rt_fade_buf, 64, max_rt_frames * ctx->frame_bytes) != 0) {
-        fprintf(stderr, "Fatal: Failed to allocate aligned RT fade buffer\n");
-        free(silence_buf);
-        return 1;
-    }
-
-    /* Allocate stack memory ONCE for the entire track lifecycle */
-    snd_pcm_hw_params_t *hwp;
-    snd_pcm_sw_params_t *swp;
-    snd_pcm_hw_params_alloca(&hwp);
-    snd_pcm_sw_params_alloca(&swp);
-
-    /* Pre-faulting: force kernel to allocate physical pages BEFORE mlock */
-    snd_pcm_format_set_silence(cmd->format, silence_buf, cmd->period_size * cmd->channels);
-    snd_pcm_format_set_silence(cmd->format, rt_fade_buf, max_rt_frames * cmd->channels);
-
-    /* Lock allocated memory pages into RAM */
-    mlock(silence_buf, max_period_bytes);
-    mlock(rt_fade_buf, max_rt_frames * ctx->frame_bytes);
-
     /* Calculate 80ms DAC warm-up frame count snapped to page boundary */
     size_t wakeup_frames = (cmd->rate * 80) / 1000;
     wakeup_frames = ((wakeup_frames + page_step - 1) / page_step) * page_step;
@@ -2508,10 +2533,9 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     ctx->cruise_delay = 0;
     ctx->ring_period_pos = 0;
 
-    /* DAC warm-up */
+    /* DAC warm-up using pre-filled silence_buf without dirtying L1/L2 cache */
     if (ctx->pcm) {
-        snd_pcm_format_set_silence(cmd->format, rt_fade_buf, wakeup_frames * cmd->channels);
-        snd_pcm_sframes_t w_warm = ALSA_WRITE(ctx->pcm, rt_fade_buf, wakeup_frames);
+        snd_pcm_sframes_t w_warm = ALSA_WRITE(ctx->pcm, silence_buf, wakeup_frames);
         if (w_warm > 0) {
             ctx->continuous_frames += (size_t)w_warm;
             ctx->ring_period_pos = (ctx->ring_period_pos + (size_t)w_warm) % chunk_frames;
@@ -2584,7 +2608,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     atomic_compare_exchange_strong_explicit(&shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
                     resume_pending = false;
                     
-                    if (ctx->pcm && (sm_state == SM_PLAYING || sm_state == SM_DRAINING)) {
+                    if (ctx->pcm && (sm_state == SM_PLAYING || sm_state == SM_DRAINING || sm_state == SM_RESUMING)) {
                         fade_is_exit = true;
                         sm_state = SM_FADING_OUT_INIT;
                         continue; 
@@ -2604,6 +2628,21 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                     if (sm_state == SM_PLAYING || sm_state == SM_DRAINING) {
                         fade_is_exit = false;
                         sm_state = SM_FADING_OUT_INIT;
+                        continue;
+                    } else if (sm_state == SM_RESUMING) {
+                        if (ctx->pcm) {
+                            fade_is_exit = false;
+                            sm_state = SM_FADING_OUT_INIT;
+                        } else {
+                            if (sys_isolated) {
+                                release_usb_dac(cmd);
+                                fast_revert_system_state(true, false);
+                                reset_process_priority();
+                                sys_isolated = false;
+                            }
+                            atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
+                            sm_state = SM_SLEEPING;
+                        }
                         continue;
                     }
                 } else if (c == CMD_RESUME) {
@@ -2782,14 +2821,16 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                             fade_is_exit = false;
                             sm_state = SM_PLAYING;
                         } else {
-                            /* Device is paused */
+                            /* Device is paused or waiting to reopen in SM_RESUMING */
                             ctx->play_frames = target_frames;
                             update_sync_base(ctx, 0);
                             atomic_store_explicit(&shm->current_frame, target_frames, memory_order_release);
                             
-                            /* Update state for JNI. Never mutate command channel internally. */
-                            atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
-                            sm_state = SM_SLEEPING;
+                            if (sm_state != SM_RESUMING) {
+                                /* Update state for JNI. Never mutate command channel internally. */
+                                atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
+                                sm_state = SM_SLEEPING;
+                            }
                         }
                     }
                 }
@@ -3233,6 +3274,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 release_usb_dac(cmd);
                 fast_revert_system_state(true, false);
                 reset_process_priority();
+                sys_isolated = false;
 
                 sm_state = SM_SLEEPING;
             }
@@ -3263,33 +3305,15 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
 
         case SM_RESUMING: {
             /* State: SM_RESUMING (Wake up and fade-in) */
-            int chk_cmd = shm ? atomic_load_explicit(&shm->command, memory_order_acquire) : CMD_NONE;
-            if (chk_cmd == CMD_PAUSE) {
-                if (ctx->pcm) {
-                    fade_is_exit = false;
-                    sm_state = SM_FADING_OUT_INIT;
-                } else {
-                    sm_state = SM_SLEEPING;
-                }
-                break;
-            }
-
-            if (chk_cmd == CMD_EXIT) {
-                if (ctx->pcm) {
-                    fade_is_exit = true;
-                    sm_state = SM_FADING_OUT_INIT;
-                } else {
-                    atomic_store(&stop_flag, 1);
-                }
-                break;
-            }
-
             bool cold_reopen = false;
             if (!ctx->pcm) {
                 cold_reopen = true;
-                acquire_usb_dac(cmd);
-                fast_apply_system_state();
-                optimize_process(cmd->cpu_core);
+                if (!sys_isolated) {
+                    acquire_usb_dac(cmd);
+                    fast_apply_system_state();
+                    optimize_process(cmd->cpu_core);
+                    sys_isolated = true;
+                }
 
                 char dev_name[64];
                 snprintf(dev_name, sizeof(dev_name), "hw:%u,%u", cmd->card, cmd->device);
@@ -3374,8 +3398,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
 
                 /* Warm up newly opened USB DAC with 80ms silence so PLL locks before fade-in */
                 if (cold_reopen) {
-                    snd_pcm_format_set_silence(cmd->format, rt_fade_buf, wakeup_frames * cmd->channels);
-                    snd_pcm_sframes_t w_warm = ALSA_WRITE(ctx->pcm, rt_fade_buf, wakeup_frames);
+                    snd_pcm_sframes_t w_warm = ALSA_WRITE(ctx->pcm, silence_buf, wakeup_frames);
                     if (w_warm > 0) {
                         ctx->continuous_frames += (size_t)w_warm;
                         ctx->ring_period_pos = (ctx->ring_period_pos + (size_t)w_warm) % chunk_frames;
@@ -3620,10 +3643,10 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
         sys_futex((int *)&shm->command, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
     }
     
-    pthread_join(watcher_tid, NULL);
-    if (cmd->expected_size > 0) {
+    if (watcher_started)
+        pthread_join(watcher_tid, NULL);
+    if (warmer_started)
         pthread_join(warmer_tid, NULL);
-    }
 
     if (cmd_efd >= 0)
         close(cmd_efd);
@@ -3835,6 +3858,10 @@ main(int argc, char **argv)
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork failed");
+        if (g_shm_fd >= 0)
+            close(g_shm_fd);
+        release_usb_dac(&cmd);
+        unlink(shm_path);
         return 1;
     }
 
