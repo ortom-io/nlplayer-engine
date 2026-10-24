@@ -243,13 +243,13 @@ struct ctx {
     long cruise_delay; 
 
     /* --- RT THREAD DATA --- */
-    /* Written exclusively by the isolated audio core */
+    /* Cache-line isolated state for RT audio thread synchronization */
     alignas(64) atomic_size_t sync_base_frames;
     atomic_size_t sync_audio_frames;
-    _Atomic(bool) wake_pending; // EventFD Userspace Optimizer
+    _Atomic(bool) wake_pending; /* EventFD userspace coalescing flag */
     
     /* --- BACKGROUND THREADS DATA --- */
-    /* Written exclusively by the warmer_thread on standard cores */
+    /* Cache-line isolated state updated by background threads */
     alignas(64) atomic_size_t live_file_frames;
     atomic_int bg_evicted_count;
     int isolated_core;
@@ -1366,16 +1366,16 @@ create_and_enter_bunker(int cpu_core)
         sys_write_opt(temp, "0");
     }
 
-    /* Enter cgroup. At this stage (before pthread_create), the process 
-       consists of only the main ALSA RT thread. */
+    /* Enter cgroup after background threads are spawned and evicted.
+       On Cgroup v1, only the main ALSA RT thread (TID) enters the bunker. */
     char buf_tid[32];
     snprintf(buf_tid, sizeof(buf_tid), "%d", sys_gettid());
     
     if (g_is_cgroup_v2) {
         /* Since we use partition="isolated", this cgroup becomes a domain root
            and cannot be a threaded controller. We must write to cgroup.procs
-           to move the entire process. Background threads will escape this 
-           domain later upon creation. */
+           to move the entire process. Background threads stay under SCHED_OTHER
+           and cannot preempt this SCHED_FIFO audio thread. */
         snprintf(temp, sizeof(temp), "%s/cgroup.procs", path_bunker);
         sys_write_opt(temp, buf_tid);
     } else {
@@ -1433,7 +1433,7 @@ reset_process_priority(void)
 
 /* =========================================================================
    AUDIO ENGINE & MAIN EXECUTION
-   Signals, WAV parsing, SHM management, ALSA loop, main().
+   Signals, memfd mapping, SHM management, ALSA loop, main().
    ========================================================================= */
 
 /* --- SIGNALS --- */
@@ -1760,7 +1760,7 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
     /* Wake up only when a full period is available */
     snd_pcm_sw_params_set_avail_min(ctx->pcm, swparams, cmd->period_size);
     
-    /* Start playback immediately after filling the first period (using actual_buffer size) */
+    /* Start playback automatically once the entire hardware ring buffer is full */
     snd_pcm_sw_params_set_start_threshold(ctx->pcm, swparams, actual_buffer);
     
     /* Stop on underrun when buffer is completely empty */
@@ -1855,7 +1855,7 @@ init_shm(uint64_t total_frames, const struct cmd *cmd)
         }
         atomic_thread_fence(memory_order_seq_cst);
         
-        /* Note: IPC thread creation is intentionally omitted here.
+        /* Note: UNIX socket IPC server is intentionally omitted here.
            It runs exclusively in the supervisor process. */
     } else {
         perror("Failed to mmap SHM");
@@ -1888,12 +1888,10 @@ evict_thread_from_rt_core(int rt_core, bool is_warmer, atomic_int *evicted_ack)
         snprintf(buf, sizeof(buf), "%d", self_tid);
 
         /* Cgroup v2 with 'isolated' partition strictly creates a Domain Root,
-           forbidding moving individual threads out. Therefore, we only attempt 
-           thread-level cgroup migration on Cgroup v1 (tasks).
-           WARNING: In pure v2, because the thread cannot escape the cgroup, 
-           sched_setaffinity will also fail (EINVAL). Background threads will 
-           remain trapped on the RT core. This is a hard Linux architectural limit 
-           for multi-threaded apps using v2 isolated partitions. */
+           forbidding thread-level cgroup migration. Therefore, we only move
+           individual threads via 'tasks' on Cgroup v1. On pure Cgroup v2,
+           entering cgroup.procs later pulls all threads into the domain,
+           where they remain strictly non-preemptive under SCHED_OTHER. */
         if (!g_is_cgroup_v2) {
             const char *paths_v1[] = {
                 "%s/system-background/tasks",
@@ -1925,8 +1923,7 @@ evict_thread_from_rt_core(int rt_core, bool is_warmer, atomic_int *evicted_ack)
             CPU_ZERO(&cpuset);
             CPU_SET(i, &cpuset);
             
-            /* Attempt to physically evict thread from the RT core.
-               In v1 (escaped), this succeeds. In v2 (trapped), this returns -EINVAL. */
+            /* Pin background thread to the first available non-RT CPU core */
             if (sched_setaffinity(self_tid, sizeof(cpu_set_t), &cpuset) == 0) {
                 pinned = true;
                 break; 
@@ -2070,9 +2067,8 @@ memory_warmer_thread(void *arg)
                    Since memfd is RAM-backed, this isolates the RT thread from 
                    kernel MMU spinlocks completely. */
                 if (warmed_offset < available_size) {
-                    /* Trace memory prefetching throughput to ensure it outpaces DAC consumption.
-                       Using memory_order_relaxed prevents ARM 'DMB ISH' hardware barriers 
-                       from thrashing the memory bus during tight loop execution. */
+                    /* Touch one byte per page to fault PTEs into the process page table.
+                       Using memory_order_relaxed emits a plain load without acquire barriers. */
                     while (warmed_offset < available_size && !atomic_load_explicit(&stop_flag, memory_order_relaxed)) {
                         __asm__ __volatile__ ("" : : "r" (ctx->map_start[warmed_offset]) : "memory");
                         warmed_offset += page_size;
@@ -2768,7 +2764,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
 
                             /* Deep reset path: PCM was stopped or had insufficient rewind margin.
                                Writes only optimal_fade_frames (~8 KB) via rt_fade_buf to preserve L1/L2 cache;
-                               SM_PLAYING immediately fills the rest of the buffer zero-copy to appl_ptr = 0. */
+                               SM_PLAYING immediately fills the rest of the buffer zero-copy from current appl_ptr. */
                             if (!rewound) {
                                 snd_pcm_drop(ctx->pcm);
                                 snd_pcm_prepare(ctx->pcm);
@@ -3406,7 +3402,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 }
 
                 /* Soft start sequence: copy only optimal_fade_frames (~8 KB) to preserve L1/L2 cache.
-                   SM_PLAYING will immediately fill the rest of the buffer via zero-copy mmap to appl_ptr = 0. */
+                   SM_PLAYING will immediately fill the rest of the buffer via zero-copy mmap from current appl_ptr. */
                 uint64_t exact_total = shm ? atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire) : 0;
                 size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
                 size_t avail_frames = (live_frames > ctx->play_frames) ? (live_frames - ctx->play_frames) : 0;
@@ -3489,7 +3485,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
                 if (target_delay < 0)
                     target_delay = 0;
 
-                /* 64-frame silence margin to prevents stop_threshold XRUN before drop */
+                /* 64-frame silence margin to prevent stop_threshold XRUN before drop */
                 if (hw_delay <= target_delay || hw_delay <= 0) {
                     track_completed = true;
                     break;
@@ -3632,7 +3628,7 @@ play_sample(struct ctx *ctx, struct cmd *cmd)
     /* Graceful shutdown */
     atomic_store(&stop_flag, 1);
     
-    /* IPC thread is handled by the supervisor, only close the descriptor locally */
+    /* IPC socket is handled by the supervisor; only close SHM fd locally */
     if (g_shm_fd >= 0) {
         close(g_shm_fd);
         g_shm_fd = -1;
@@ -3662,7 +3658,7 @@ run_player_child(struct cmd *cmd)
     /* Apply system tweaks */
     fast_apply_system_state();
 
-    /* Initialize file, WAV, and PCM contexts */
+    /* Initialize memfd mapping and ALSA PCM context */
     if (ctx_init(&ctx, cmd) < 0) {
         /* ctx_init handles its own cleanup on failure */
         return 1; 
@@ -3840,8 +3836,8 @@ main(int argc, char **argv)
     /* Hardware capabilities are checked inside ctx_init */
 
     /* Open SHM file before forking so the child inherits the file descriptor.
-       We do NOT start the IPC thread yet to avoid POSIX fork-safety hazards
-       (deadlocks from inherited locked mutexes in a multi-threaded fork). */
+       Worker threads are spawned only in the child after fork() to avoid
+       POSIX multi-threaded fork hazards. */
     const char *shm_path = cmd.shm_file ? cmd.shm_file : g_shm_path;
     
     g_shm_fd = open(shm_path, O_RDWR | O_CLOEXEC);
@@ -3925,7 +3921,7 @@ main(int argc, char **argv)
             }
         }
 
-        /* --- THE GOD-TIER EVENT LOOP --- */
+        /* --- SUPERVISOR IPC EVENT LOOP --- */
         int status = 0;
         bool child_reaped = false;
         struct pollfd pfd = { .fd = server_fd, .events = POLLIN, .revents = 0 };
