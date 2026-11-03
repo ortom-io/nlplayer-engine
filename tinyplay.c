@@ -119,6 +119,18 @@
 #endif
 #endif
 
+#ifndef SYS_memfd_create
+#ifdef __NR_memfd_create
+#define SYS_memfd_create __NR_memfd_create
+#elif defined(__aarch64__)
+#define SYS_memfd_create 279
+#elif defined(__x86_64__)
+#define SYS_memfd_create 319
+#else
+#define SYS_memfd_create 385
+#endif
+#endif
+
 /* Priority and scheduling defines */
 #ifndef IOPRIO_WHO_PROCESS
 #define IOPRIO_WHO_PROCESS 1
@@ -142,6 +154,52 @@
 
 #ifndef SCHED_BATCH
 #define SCHED_BATCH 3
+#endif
+
+/* memfd and sealing defines */
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
+#endif
+
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS 1033
+#endif
+
+#ifndef F_SEAL_SEAL
+#define F_SEAL_SEAL 0x0001
+#endif
+
+#ifndef F_SEAL_SHRINK
+#define F_SEAL_SHRINK 0x0002
+#endif
+
+#ifndef F_SEAL_GROW
+#define F_SEAL_GROW 0x0004
+#endif
+
+/* VFS mount flags */
+#ifndef MS_RDONLY
+#define MS_RDONLY 1
+#endif
+
+#ifndef MS_NOSUID
+#define MS_NOSUID 2
+#endif
+
+#ifndef MS_NODEV
+#define MS_NODEV 4
+#endif
+
+#ifndef MS_NOEXEC
+#define MS_NOEXEC 8
+#endif
+
+#ifndef MS_REMOUNT
+#define MS_REMOUNT 32
 #endif
 
 #ifndef MS_BIND
@@ -173,9 +231,13 @@ sys_gettid(void)
     return syscall(SYS_gettid);
 }
 
+static inline int
+sys_memfd_create(const char *name, unsigned int flags)
+{
+    return syscall(SYS_memfd_create, name, flags);
+}
+
 /* --- CONFIGURATION --- */
-#define DEFAULT_SHM_FILE "/mnt/nlp/tinyplay_shm"
-#define SHIELD_DIR       "/mnt/nlp/tmp"
 #define MY_BUNKER        "tiny_shield"
 #define MAX_STATE_ENTRIES 2048
 
@@ -196,7 +258,6 @@ sys_gettid(void)
 /* --- GLOBALS --- */
 static char g_cpuset_root[128] = "/dev/cpuset";
 static int g_pm_qos_fd = -1;
-static const char *g_shm_path = DEFAULT_SHM_FILE;
 static pid_t g_child_pid = -1;
 static bool g_is_cgroup_v2 = false;
 
@@ -585,41 +646,21 @@ exclude_cpu_from_list(const char *in_str, char *out_buf, size_t out_size, int cp
 static void
 precalc_usb_irqs(int cpu_core)
 {
+    if (cpu_core < 0 || cpu_core >= 64)
+        return;
+
     FILE *fp = fopen("/proc/interrupts", "r");
     if (!fp)
         return;
     
-    char line[1024], proc_path[64], core_str[16], hex_str[16];
+    char line[1024], proc_path[64], core_str[16], hex_str[24];
     
-    /* Calculate values */
+    /* Calculate values formatted for Linux kernel bitmap_parse (32-bit hex chunks) */
     snprintf(core_str, sizeof(core_str), "%d", cpu_core);
-    snprintf(hex_str, sizeof(hex_str), "%x", (1 << cpu_core));
-    
-    /* Prepare paths for dummy files */
-    char dummy_path[128], dummy_hex[128];
-    snprintf(dummy_path, sizeof(dummy_path), "%s/shield_list", SHIELD_DIR);
-    snprintf(dummy_hex, sizeof(dummy_hex), "%s/shield_hex", SHIELD_DIR);
-
-    /* Ensure base directories exist */
-    mkdir("/mnt/nlp", 0755);
-    mkdir(SHIELD_DIR, 0755);
-
-    /* Write list dummy file */
-    int fd = open(dummy_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd >= 0) {
-        write(fd, core_str, strlen(core_str));
-        close(fd);
+    if (cpu_core < 32) {
+        snprintf(hex_str, sizeof(hex_str), "%x", (1U << cpu_core));
     } else {
-        perror("Failed to create shield_list dummy file");
-    }
-
-    /* Write hex dummy file */
-    fd = open(dummy_hex, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd >= 0) {
-        write(fd, hex_str, strlen(hex_str));
-        close(fd);
-    } else {
-        perror("Failed to create shield_hex dummy file");
+        snprintf(hex_str, sizeof(hex_str), "%x,00000000", (1U << (cpu_core - 32)));
     }
 
     /* Scan interrupts and apply rules */
@@ -636,12 +677,13 @@ precalc_usb_irqs(int cpu_core)
             if (irq <= 0)
                 continue;
             
-            /* Set smp_affinity_list */
+            /* Detach any stale mount from a previous SIGKILL crash before reading original_val */
             snprintf(proc_path, sizeof(proc_path), "/proc/irq/%ld/smp_affinity_list", irq);
+            umount2(proc_path, MNT_DETACH);
             register_change(proc_path, core_str, true);
 
-            /* Set smp_affinity */
             snprintf(proc_path, sizeof(proc_path), "/proc/irq/%ld/smp_affinity", irq);
+            umount2(proc_path, MNT_DETACH);
             register_change(proc_path, hex_str, true);
         }
     }
@@ -1195,26 +1237,24 @@ fast_apply_system_state(void)
             g_pm_qos_fd = qos_fd;
         }
     }
-    
-    char dummy_path[128], dummy_hex[128];
-    snprintf(dummy_path, sizeof(dummy_path), "%s/shield_list", SHIELD_DIR);
-    snprintf(dummy_hex, sizeof(dummy_hex), "%s/shield_hex", SHIELD_DIR);
 
     for (int i = 0; i < g_state_count; i++) {
         if (!g_state_cache[i].is_mount_point) {
             sys_write_opt(g_state_cache[i].path, g_state_cache[i].target_val);
         } else {
             umount2(g_state_cache[i].path, MNT_DETACH);
-            chmod(g_state_cache[i].path, 0666);
+            /* Use 0644 instead of 0666 so procfs nodes are never left world-writable */
+            chmod(g_state_cache[i].path, 0644);
             sys_write_opt(g_state_cache[i].path, g_state_cache[i].target_val);
-            
-            /* Select appropriate dummy file */
-            const char *src = dummy_path;
-            if (strstr(g_state_cache[i].path, "smp_affinity") && !strstr(g_state_cache[i].path, "_list")) {
-                src = dummy_hex;
-            }
 
-            if (mount(src, g_state_cache[i].path, "", MS_BIND, NULL) != 0) {
+            /* Lock affinity node via read-only self-bind mount to prevent external overrides.
+               Preserve nosuid/nodev/noexec flags required by hardened procfs mounts. */
+            if (mount(g_state_cache[i].path, g_state_cache[i].path, "", MS_BIND, NULL) == 0) {
+                unsigned long ro_flags = MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC;
+                if (mount(g_state_cache[i].path, g_state_cache[i].path, "", ro_flags, NULL) != 0) {
+                    mount(g_state_cache[i].path, g_state_cache[i].path, "", MS_REMOUNT | MS_BIND | MS_RDONLY, NULL);
+                }
+            } else {
                 perror("mount bind failed");
             }
         }
@@ -1822,15 +1862,20 @@ init_shm(uint64_t total_frames, const struct cmd *cmd)
         if (current_magic != 0xDEADBEEF) {
             /* Fresh memory, initialize completely */
             atomic_init(&shm->command, CMD_NONE);
-            atomic_init(&shm->futex_waiters, 0); 
+            atomic_init(&shm->futex_waiters, 0);
+            atomic_init(&shm->seek_target, 0);
             atomic_init(&shm->state, STATE_PAUSED);
             atomic_init(&shm->total_frames, total_frames);
             atomic_init(&shm->current_frame, 0);
-            atomic_init(&shm->exact_total_frames, 0);
+            /* Preserve exact_total_frames if JNI attached and populated it before engine startup */
+            if (!cmd || !cmd->shm_file) {
+                atomic_init(&shm->exact_total_frames, 0);
+            }
             
             if (cmd) {
                 atomic_init(&shm->sample_rate, cmd->rate);
                 atomic_init(&shm->channels, cmd->channels);
+                atomic_init(&shm->bits, snd_pcm_format_physical_width(cmd->format));
                 atomic_init(&shm->hw_period_size, cmd->period_size);
                 atomic_init(&shm->hw_buffer_size, cmd->period_size * cmd->period_count);
                 atomic_init(&shm->hw_format, cmd->format);
@@ -1838,15 +1883,23 @@ init_shm(uint64_t total_frames, const struct cmd *cmd)
             }
             atomic_store_explicit(&shm->magic, 0xDEADBEEF, memory_order_release);
         } else {
-            /* Memory already initialized, update playback state */
+            /* Memory already initialized, reset control channel and update playback state */
+            uint64_t prev_total = atomic_load_explicit(&shm->total_frames, memory_order_acquire);
+            atomic_store_explicit(&shm->command, CMD_NONE, memory_order_release);
+            atomic_store_explicit(&shm->futex_waiters, 0, memory_order_release);
             atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
             atomic_store_explicit(&shm->total_frames, total_frames, memory_order_release);
             atomic_store_explicit(&shm->current_frame, 0, memory_order_release);
-            atomic_store_explicit(&shm->exact_total_frames, 0, memory_order_release);
+            /* Reset exact_total_frames only if starting a different track from frame 0;
+               preserve it when reloading settings mid-track. */
+            if (prev_total != 0 && prev_total != total_frames && (!cmd || cmd->initial_seek == 0)) {
+                atomic_store_explicit(&shm->exact_total_frames, 0, memory_order_release);
+            }
             
             if (cmd) {
                 atomic_store_explicit(&shm->sample_rate, cmd->rate, memory_order_release);
                 atomic_store_explicit(&shm->channels, cmd->channels, memory_order_release);
+                atomic_store_explicit(&shm->bits, snd_pcm_format_physical_width(cmd->format), memory_order_release);
                 atomic_store_explicit(&shm->hw_period_size, cmd->period_size, memory_order_release);
                 atomic_store_explicit(&shm->hw_buffer_size, cmd->period_size * cmd->period_count, memory_order_release);
                 atomic_store_explicit(&shm->hw_format, cmd->format, memory_order_release);
@@ -3695,7 +3748,7 @@ cmd_init(struct cmd *cmd)
     cmd->rate = 48000;
     cmd->format = SND_PCM_FORMAT_S16_LE;
     cmd->cpu_core = -1;
-    cmd->shm_file = DEFAULT_SHM_FILE;
+    cmd->shm_file = NULL;
     cmd->expected_size = 0;
 
     cmd->usb_uevent_path[0] = '\0';
@@ -3835,19 +3888,36 @@ main(int argc, char **argv)
 
     /* Hardware capabilities are checked inside ctx_init */
 
-    /* Open SHM file before forking so the child inherits the file descriptor.
+    /* Open SHM memfd before forking so the child inherits the file descriptor.
        Worker threads are spawned only in the child after fork() to avoid
        POSIX multi-threaded fork hazards. */
-    const char *shm_path = cmd.shm_file ? cmd.shm_file : g_shm_path;
-    
-    g_shm_fd = open(shm_path, O_RDWR | O_CLOEXEC);
-    if (g_shm_fd < 0) {
-        g_shm_fd = open(shm_path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    bool created_local_memfd = false;
+    if (cmd.shm_file) {
+        g_shm_fd = open(cmd.shm_file, O_RDWR | O_CLOEXEC);
     }
-    
+
+    if (g_shm_fd < 0) {
+        g_shm_fd = sys_memfd_create("tinyplay_shm", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        created_local_memfd = (g_shm_fd >= 0);
+    }
+
     if (g_shm_fd >= 0) {
-        fchmod(g_shm_fd, 0666); 
-        ftruncate(g_shm_fd, sizeof(struct player_ctrl));
+        fchmod(g_shm_fd, 0666);
+        struct stat shm_st;
+        if (fstat(g_shm_fd, &shm_st) != 0) {
+            close(g_shm_fd);
+            g_shm_fd = -1;
+        } else if (shm_st.st_size < (off_t)sizeof(struct player_ctrl)) {
+            /* Resize only if smaller than 256B; avoids EPERM on already-sealed JNI memfd.
+               If ftruncate fails, close fd to prevent SIGBUS upon mmap access. */
+            if (ftruncate(g_shm_fd, sizeof(struct player_ctrl)) != 0) {
+                perror("ftruncate SHM failed");
+                close(g_shm_fd);
+                g_shm_fd = -1;
+            } else if (created_local_memfd) {
+                fcntl(g_shm_fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL);
+            }
+        }
     }
 
     /* Fork process strictly as a single-threaded application */
@@ -3857,7 +3927,6 @@ main(int argc, char **argv)
         if (g_shm_fd >= 0)
             close(g_shm_fd);
         release_usb_dac(&cmd);
-        unlink(shm_path);
         return 1;
     }
 
@@ -3898,10 +3967,15 @@ main(int argc, char **argv)
         sigaddset(&block_mask, SIGCHLD);
         sigprocmask(SIG_BLOCK, &block_mask, &orig_mask);
 
-        /* Initialize local IPC server socket */
+        /* Initialize local IPC server socket.
+           Resolve non-root client UID from SHM fd, procfs fd symlink (lstat), or target file (stat). */
         uid_t app_owner_uid = 0;
         struct stat st;
-        if (fstat(g_shm_fd, &st) == 0) {
+        if (g_shm_fd >= 0 && fstat(g_shm_fd, &st) == 0 && st.st_uid != 0) {
+            app_owner_uid = st.st_uid;
+        } else if (lstat(cmd.filename, &st) == 0 && st.st_uid != 0) {
+            app_owner_uid = st.st_uid;
+        } else if (stat(cmd.filename, &st) == 0 && st.st_uid != 0) {
             app_owner_uid = st.st_uid;
         }
 
@@ -4011,8 +4085,7 @@ main(int argc, char **argv)
         /* Release USB DAC */
         release_usb_dac(&cmd); 
         
-        fast_revert_system_state(true, true); 
-        unlink(shm_path);
+        fast_revert_system_state(true, true);
 
         /* Return correct exit code */
         if (WIFSIGNALED(status))
