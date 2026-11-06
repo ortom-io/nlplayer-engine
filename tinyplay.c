@@ -115,8 +115,71 @@ ring_pos_add_safe(size_t pos, size_t adv, size_t period)
     return next % period;
 }
 
+/* Direct Linux kernel ALSA UAPI definitions for zero-libasound RT hot path.
+   Defined explicitly to avoid header type conflicts with <alsa/asoundlib.h>.
+   Note on SNDRV_PCM_SYNC_PTR flags in sound/core/pcm_native.c:
+   - SNDRV_PCM_SYNC_PTR_APPL == 0 commits userspace appl_ptr to kernel;
+     SNDRV_PCM_SYNC_PTR_APPL == 1 reads kernel appl_ptr to userspace.
+   - SNDRV_PCM_SYNC_PTR_AVAIL_MIN == 1 preserves kernel avail_min without overwriting. */
+#define SNDRV_PCM_SYNC_PTR_HWSYNC     (1U << 0)
+#define SNDRV_PCM_SYNC_PTR_APPL       (1U << 1)
+#define SNDRV_PCM_SYNC_PTR_AVAIL_MIN  (1U << 2)
+
+struct snd_pcm_mmap_status {
+    snd_pcm_state_t state;
+    int pad1;
+    snd_pcm_uframes_t hw_ptr;
+    struct timespec tstamp;
+    snd_pcm_state_t suspended_state;
+    struct timespec audio_tstamp;
+};
+
+struct snd_pcm_mmap_control {
+    snd_pcm_uframes_t appl_ptr;
+    snd_pcm_uframes_t avail_min;
+};
+
+struct snd_pcm_sync_ptr {
+    unsigned int flags;
+    union {
+        struct snd_pcm_mmap_status status;
+        unsigned char reserved[64];
+    } s;
+    union {
+        struct snd_pcm_mmap_control control;
+        unsigned char reserved[64];
+    } c;
+};
+
+struct snd_xferi {
+    snd_pcm_sframes_t result;
+    void *buf;
+    snd_pcm_uframes_t frames;
+};
+
 #ifndef SNDRV_PCM_IOCTL_DELAY
-#define SNDRV_PCM_IOCTL_DELAY _IOR('A', 0x21, snd_pcm_sframes_t)
+#define SNDRV_PCM_IOCTL_DELAY         _IOR('A', 0x21, snd_pcm_sframes_t)
+#endif
+#ifndef SNDRV_PCM_IOCTL_SYNC_PTR
+#define SNDRV_PCM_IOCTL_SYNC_PTR      _IOWR('A', 0x23, struct snd_pcm_sync_ptr)
+#endif
+#ifndef SNDRV_PCM_IOCTL_PREPARE
+#define SNDRV_PCM_IOCTL_PREPARE       _IO('A', 0x40)
+#endif
+#ifndef SNDRV_PCM_IOCTL_START
+#define SNDRV_PCM_IOCTL_START         _IO('A', 0x42)
+#endif
+#ifndef SNDRV_PCM_IOCTL_DROP
+#define SNDRV_PCM_IOCTL_DROP          _IO('A', 0x43)
+#endif
+#ifndef SNDRV_PCM_IOCTL_REWIND
+#define SNDRV_PCM_IOCTL_REWIND        _IOW('A', 0x46, snd_pcm_uframes_t)
+#endif
+#ifndef SNDRV_PCM_IOCTL_RESUME
+#define SNDRV_PCM_IOCTL_RESUME        _IO('A', 0x47)
+#endif
+#ifndef SNDRV_PCM_IOCTL_WRITEI_FRAMES
+#define SNDRV_PCM_IOCTL_WRITEI_FRAMES _IOW('A', 0x50, struct snd_xferi)
 #endif
 
 /* Fallback definitions for older headers */
@@ -316,42 +379,59 @@ static volatile atomic_int stop_flag = 0;
 alignas(64) static int g_shm_fd = -1;
 static volatile sig_atomic_t g_child_exited = 0;
 
+/* Non-escaping RT ring state.
+   Instantiated strictly on the stack of play_sample() and passed only to ATTR_ALWAYS_INLINE
+   helpers. Because its address never escapes to pthread_create, ioctl, or poll, compiler
+   SROA promotes all fields into callee-saved CPU registers with zero L1d loads/stores. */
+struct rt_state {
+    uint8_t *dma_area;
+    snd_pcm_uframes_t appl_ptr;
+    snd_pcm_uframes_t boundary;
+    size_t ring_buf_pos;
+    size_t known_avail;
+    uint32_t buffer_frames;
+    uint32_t period_frames;
+    int rt_alsa_fd;
+    uint8_t pcm_state;
+    bool need_poll;
+    bool zero_silence;
+};
+
 /* Standard Structures */
 struct ctx {
-    /* --- CACHE LINE 0 (64B): EXCLUSIVE RT AUDIO HOT STATE (58B used, 6B pad) --- */
-    /* Never read or written by background threads; stays in Exclusive/Modified L1d state */
-    alignas(64) snd_pcm_t *pcm;
-    uint8_t *data_start;
-    size_t data_frames;
-    size_t play_frames;
-    size_t ring_period_pos;
-    size_t continuous_frames;
-    long cruise_delay;
-    bool is_cruising;
-    bool need_poll;
-
-    /* --- CACHE LINE 1 (64B): RT <-> WATCHER IPC & SYNC DATA --- */
+    /* --- CACHE LINE 0 (64B): RT <-> WATCHER IPC & SYNC DATA (25B used, 39B pad) --- */
     /* Cache-line isolated state for lock-free UI timer and EventFD coalescing */
     alignas(64) atomic_size_t sync_base_frames;
     atomic_size_t sync_audio_frames;
-    int alsa_fd;
+    atomic_int alsa_fd;
+    atomic_int bg_evicted_count;
     _Atomic(bool) wake_pending; /* EventFD userspace coalescing flag */
 
-    /* --- CACHE LINE 2 (64B): BACKGROUND WARMER & VFS MAPPING DATA --- */
-    /* Cache-line isolated state updated by background threads and init */
+    /* --- CACHE LINE 1 (64B): BACKGROUND WARMER & STREAM MAPPING DATA (48B used, 16B pad) --- */
+    /* Self-contained warmer cache line: warmer thread never touches Cache Line 0 or 2 */
     alignas(64) atomic_size_t live_file_frames;
     uint8_t *map_start;
     size_t map_size;
-    size_t data_size;
+    size_t data_frames;
     size_t frame_bytes;
     int fd;
     int isolated_core;
-    atomic_int bg_evicted_count;
+
+    /* --- CACHE LINE 2 (64B): COLD ALSA & STREAM INIT DATA (45B used, 19B pad) --- */
+    /* Populated during cold setup and copied once into local struct rt_state registers */
+    alignas(64) snd_pcm_t *pcm;
+    uint8_t *data_start;
+    uint8_t *init_dma_area;
+    snd_pcm_uframes_t init_boundary;
+    uint32_t init_buffer_frames;
+    uint32_t init_period_frames;
+    int init_alsa_fd;
+    bool zero_silence;
 };
 
-_Static_assert(__builtin_offsetof(struct ctx, sync_base_frames) == 64,
+_Static_assert(__builtin_offsetof(struct ctx, live_file_frames) == 64,
                "Cache Line 0 overflowed 64 bytes");
-_Static_assert(__builtin_offsetof(struct ctx, live_file_frames) == 128,
+_Static_assert(__builtin_offsetof(struct ctx, pcm) == 128,
                "Cache Line 1 overflowed 64 bytes");
 _Static_assert(sizeof(struct ctx) <= 192,
                "Cache Line 2 overflowed 64 bytes");
@@ -1640,7 +1720,6 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
 
     /* Treat all incoming data as Raw PCM */
     ctx->data_start = ctx->map_start;
-    ctx->data_size = (cmd->expected_size > 0) ? cmd->expected_size : ctx->map_size;
 
     char dev_name[64];
     snprintf(dev_name, sizeof(dev_name), "hw:%u,%u", cmd->card, cmd->device);
@@ -1865,27 +1944,60 @@ ctx_init(struct ctx *ctx, struct cmd *cmd)
         fprintf(stderr, "Warning: Failed to set ALSA sw_params (%s)\n", snd_strerror(err));
     }
 
+    /* Extract kernel ring buffer boundary for direct appl_ptr wrap-around math */
+    if (snd_pcm_sw_params_get_boundary(swparams, &ctx->init_boundary) < 0 || ctx->init_boundary == 0) {
+        ctx->init_boundary = actual_buffer;
+        while (ctx->init_boundary <= (snd_pcm_uframes_t)(LONG_MAX / 2) - actual_buffer) {
+            ctx->init_boundary <<= 1;
+        }
+    }
+    ctx->init_buffer_frames = (uint32_t)actual_buffer;
+    ctx->init_period_frames = (uint32_t)cmd->period_size;
+    ctx->zero_silence = (snd_pcm_format_silence_64(cmd->format) == 0);
+
     /* Prepare buffer for initial start */
-    snd_pcm_prepare(ctx->pcm);
+    if ((err = snd_pcm_prepare(ctx->pcm)) < 0) {
+        fprintf(stderr, "Fatal: snd_pcm_prepare failed (%s)\n", snd_strerror(err));
+        return -1;
+    }
+
+    /* Extract base pointer of the already-mmapped kernel DMA ring buffer once.
+       Reuses alsa-lib's VMA directly without creating duplicate TLB mappings. */
+    ctx->init_dma_area = NULL;
+    if (cmd->use_mmap) {
+        const snd_pcm_channel_area_t *areas = NULL;
+        snd_pcm_uframes_t mmap_offset = 0;
+        snd_pcm_uframes_t mmap_frames = actual_buffer;
+        if (snd_pcm_mmap_begin(ctx->pcm, &areas, &mmap_offset, &mmap_frames) == 0 &&
+            areas && areas[0].addr) {
+            ctx->init_dma_area = (uint8_t *)areas[0].addr + (areas[0].first >> 3);
+        } else {
+            fprintf(stderr, "Fatal: Failed to acquire MMAP DMA buffer address.\n");
+            return -1;
+        }
+    }
 
     /* Retrieve direct Kernel FD for lock-free ALSA bypass */
-    ctx->alsa_fd = -1;
+    int init_alsa_fd = -1;
     if (snd_pcm_type(ctx->pcm) == SND_PCM_TYPE_HW) {
         int count = snd_pcm_poll_descriptors_count(ctx->pcm);
         if (count >= 1 && count < 16) {
             struct pollfd pfds[16];
             if (snd_pcm_poll_descriptors(ctx->pcm, pfds, count) == count) {
-                ctx->alsa_fd = pfds[0].fd;
+                init_alsa_fd = pfds[0].fd;
             }
         }
-    } else {
-        fprintf(stderr, "Warning: PCM is not direct HW. IOCTL bypass disabled.\n");
+    }
+    ctx->init_alsa_fd = init_alsa_fd;
+    atomic_init(&ctx->alsa_fd, init_alsa_fd);
+    if (init_alsa_fd < 0) {
+        fprintf(stderr, "Fatal: Failed to obtain direct kernel PCM file descriptor.\n");
+        return -1;
     }
 
     /* --- PRECALCULATE RT CONSTANTS --- */
     ctx->frame_bytes = (snd_pcm_format_physical_width(cmd->format) / 8) * cmd->channels;
-    ctx->data_frames = (ctx->data_size > 0 && ctx->frame_bytes > 0) ? (ctx->data_size / ctx->frame_bytes) : 0;
-    ctx->play_frames = 0;
+    ctx->data_frames = (ctx->map_size > 0 && ctx->frame_bytes > 0) ? (ctx->map_size / ctx->frame_bytes) : 0;
 
     struct stat sb;
     if (fstat(ctx->fd, &sb) == 0) {
@@ -2081,24 +2193,29 @@ struct watcher_args {
 static ATTR_HOT void *
 shm_watcher_thread(void *arg)
 {
-    struct watcher_args *wargs = (struct watcher_args *)arg;
-    evict_thread_from_rt_core(wargs->cmd->cpu_core, false, &wargs->ctx->bg_evicted_count);
+    struct watcher_args *const __restrict__ wargs = (struct watcher_args *)arg;
+    struct ctx *const __restrict__ ctx = wargs->ctx;
+    struct player_ctrl *const __restrict__ local_shm = shm;
+    const long max_hw_buffer = (long)(wargs->cmd->period_size * wargs->cmd->period_count);
+    const int cmd_efd = wargs->cmd_efd;
+
+    evict_thread_from_rt_core(wargs->cmd->cpu_core, false, &ctx->bg_evicted_count);
     
     while (!atomic_load_explicit(&stop_flag, memory_order_acquire)) {
         int current_cmd;
         
-        while ((current_cmd = atomic_load_explicit(&shm->command, memory_order_acquire)) == CMD_NONE && 
+        while ((current_cmd = atomic_load_explicit(&local_shm->command, memory_order_acquire)) == CMD_NONE && 
                !atomic_load_explicit(&stop_flag, memory_order_relaxed)) {
             
             /* Smart Futex: Notify JNI we are sleeping (Strict seq_cst barrier) */
-            atomic_fetch_add_explicit(&shm->futex_waiters, 1, memory_order_seq_cst);
+            atomic_fetch_add_explicit(&local_shm->futex_waiters, 1, memory_order_seq_cst);
             
-            if (atomic_load_explicit(&shm->command, memory_order_seq_cst) == CMD_NONE) {
-                sys_futex((int *)&shm->command, FUTEX_WAIT, CMD_NONE, NULL, NULL, 0);
+            if (atomic_load_explicit(&local_shm->command, memory_order_seq_cst) == CMD_NONE) {
+                sys_futex((int *)&local_shm->command, FUTEX_WAIT, CMD_NONE, NULL, NULL, 0);
             }
             
             /* Woken up: Remove sleeping flag */
-            atomic_fetch_sub_explicit(&shm->futex_waiters, 1, memory_order_seq_cst);
+            atomic_fetch_sub_explicit(&local_shm->futex_waiters, 1, memory_order_seq_cst);
         }
         
         if (unlikely(atomic_load_explicit(&stop_flag, memory_order_acquire)))
@@ -2107,39 +2224,43 @@ shm_watcher_thread(void *arg)
         /* Direct kernel bypass for real-time timer synchronization */
         if (likely(current_cmd == CMD_UPDATE_TIME)) {
             /* Acquire barrier on sync_base_frames orders the subsequent relaxed load of sync_audio_frames */
-            size_t base_frames = atomic_load_explicit(&wargs->ctx->sync_base_frames, memory_order_acquire);
-            size_t audio_frames = atomic_load_explicit(&wargs->ctx->sync_audio_frames, memory_order_relaxed);
+            size_t base_frames = atomic_load_explicit(&ctx->sync_base_frames, memory_order_acquire);
+            size_t audio_frames = atomic_load_explicit(&ctx->sync_audio_frames, memory_order_relaxed);
             snd_pcm_sframes_t delay_frames = 0;
 
-            if (wargs->ctx->alsa_fd >= 0) {
-                if (ioctl(wargs->ctx->alsa_fd, SNDRV_PCM_IOCTL_DELAY, &delay_frames) < 0) {
+            int pcm_fd = atomic_load_explicit(&ctx->alsa_fd, memory_order_acquire);
+            if (likely(pcm_fd >= 0)) {
+                if (unlikely(ioctl(pcm_fd, SNDRV_PCM_IOCTL_DELAY, &delay_frames) < 0)) {
                     delay_frames = 0;
                 }
             }
 
-            long max_hw_buffer = wargs->cmd->period_size * wargs->cmd->period_count;
-            if (delay_frames < 0) delay_frames = 0;
-            else if (max_hw_buffer > 0 && delay_frames > max_hw_buffer) delay_frames = max_hw_buffer; 
+            if (unlikely(delay_frames < 0))
+                delay_frames = 0;
+            else if (unlikely(max_hw_buffer > 0 && delay_frames > max_hw_buffer))
+                delay_frames = max_hw_buffer; 
 
             long acoustic = (long)base_frames - delay_frames;
-            if (acoustic > (long)audio_frames) acoustic = (long)audio_frames;
-            if (acoustic < 0) acoustic = 0;
+            if (acoustic > (long)audio_frames)
+                acoustic = (long)audio_frames;
+            if (acoustic < 0)
+                acoustic = 0;
 
-            atomic_store_explicit(&shm->current_frame, (uint64_t)acoustic, memory_order_relaxed);
+            atomic_store_explicit(&local_shm->current_frame, (uint64_t)acoustic, memory_order_relaxed);
 
             /* Complete command. NO FUTEX_WAKE NEEDED (JNI uses Spin-Wait) */
             int expected_cmd = CMD_UPDATE_TIME;
-            atomic_compare_exchange_strong_explicit(&shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
+            atomic_compare_exchange_strong_explicit(&local_shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
             continue;
         }
 
         if (current_cmd == CMD_PAUSE || current_cmd == CMD_SEEK || current_cmd == CMD_EXIT || current_cmd == CMD_RESUME) {
             /* Zero-syscall EventFD optimization */
             bool expected = false;
-            if (atomic_compare_exchange_strong_explicit(&wargs->ctx->wake_pending, &expected, true, memory_order_acq_rel, memory_order_relaxed)) {
+            if (atomic_compare_exchange_strong_explicit(&ctx->wake_pending, &expected, true, memory_order_acq_rel, memory_order_relaxed)) {
                 uint64_t val = 1;
                 /* Asynchronous zero-signal wakeup for the RT thread's poll() */
-                write(wargs->cmd_efd, &val, sizeof(val)); 
+                write(cmd_efd, &val, sizeof(val)); 
             }
         }
     }
@@ -2151,7 +2272,7 @@ shm_watcher_thread(void *arg)
 static ATTR_HOT void *
 memory_warmer_thread(void *arg)
 {
-    struct ctx *ctx = (struct ctx *)arg;
+    struct ctx *const __restrict__ ctx = (struct ctx *)arg;
     
     evict_thread_from_rt_core(ctx->isolated_core, true, &ctx->bg_evicted_count);
 
@@ -2160,15 +2281,20 @@ memory_warmer_thread(void *arg)
     const size_t map_size = ctx->map_size;
     const size_t frame_bytes = ctx->frame_bytes;
     const uint8_t *const map_start = ctx->map_start;
+    const int fd = ctx->fd;
+    const struct player_ctrl *const __restrict__ local_shm = shm;
     size_t warmed_offset = 0;
     size_t published_size = 0;
+    bool is_ffmpeg_done = false;
     
     while (!atomic_load_explicit(&stop_flag, memory_order_acquire)) {
-        bool is_ffmpeg_done = (shm && atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire) > 0);
+        if (!is_ffmpeg_done && local_shm != NULL) {
+            is_ffmpeg_done = (atomic_load_explicit(&local_shm->exact_total_frames, memory_order_acquire) > 0);
+        }
         struct stat st;
         
         /* Fast atomic query of the underlying memfd size to detect JNI write progress */
-        if (fstat(ctx->fd, &st) == 0) {
+        if (fstat(fd, &st) == 0) {
             if (st.st_size > 0) {
                 size_t available_size = (size_t)st.st_size;
                 if (available_size > map_size)
@@ -2427,60 +2553,341 @@ ack_cmd_efd(struct ctx *ctx, int cmd_efd)
     }
 }
 
-/* Safely queries the ALSA hardware delay in frames via direct kernel bypass. */
-static ATTR_HOT long
-get_safe_alsa_delay(const struct ctx *__restrict__ ctx, const struct cmd *__restrict__ cmd)
+/* Reads the RT-private file descriptor directly from the register-promoted struct rt_state */
+static ATTR_HOT ATTR_ALWAYS_INLINE int
+rt_get_alsa_fd(const struct rt_state *__restrict__ rt)
 {
-    if (unlikely(!ctx || ctx->alsa_fd < 0 || !cmd))
+    return rt->rt_alsa_fd;
+}
+
+/* Safely queries the ALSA hardware delay in frames via direct kernel bypass.
+   Inlined so struct rt_state never has its address taken across function boundaries. */
+static ATTR_HOT ATTR_ALWAYS_INLINE long
+get_safe_alsa_delay(const struct rt_state *__restrict__ rt)
+{
+    int pcm_fd = rt_get_alsa_fd(rt);
+    if (unlikely(pcm_fd < 0))
         return 0;
 
     snd_pcm_sframes_t delay_sf = 0;
-    if (unlikely(ioctl(ctx->alsa_fd, SNDRV_PCM_IOCTL_DELAY, &delay_sf) < 0))
+    if (unlikely(ioctl(pcm_fd, SNDRV_PCM_IOCTL_DELAY, &delay_sf) < 0))
         return 0;
 
     long delay_frames = (long)delay_sf;
     if (unlikely(delay_frames < 0))
         return 0;
 
-    /* Filter out invalid delays from buggy ALSA drivers */
-    long max_hw_buffer = (long)(cmd->period_size * cmd->period_count);
+    /* Filter out invalid delays from buggy ALSA drivers using precomputed buffer_frames */
+    long max_hw_buffer = (long)rt->buffer_frames;
     if (unlikely(max_hw_buffer > 0 && delay_frames > max_hw_buffer))
         return max_hw_buffer;
 
     return delay_frames;
 }
 
+/* Hardware-accelerated silence fill for RT paths.
+   Uses precomputed rt->zero_silence to avoid PLT calls into libasound.so.
+   All signed PCM and IEEE-754 float formats have 0x00 as digital silence,
+   enabling single-pass cache-line zeroing (DC ZVA / rep stosb). */
+static ATTR_HOT ATTR_ALWAYS_INLINE void
+rt_set_silence(const struct rt_state *__restrict__ rt, void *__restrict__ dst,
+               size_t frames, size_t frame_bytes, const struct cmd *__restrict__ cmd)
+{
+    if (likely(rt->zero_silence)) {
+        __builtin_memset(dst, 0, frames * frame_bytes);
+    } else {
+        snd_pcm_format_set_silence(cmd->format, dst, frames * cmd->channels);
+    }
+}
+
+/* Synchronizes appl_ptr, hw_ptr, and stream state directly with the kernel PCM substream.
+   In sound/core/pcm_native.c (snd_pcm_sync_ptr), the kernel only reads flags (4B) and
+   c.control (16B) from userspace and overwrites the rest on copy_to_user, requiring
+   only 3 register stores before the syscall. */
+static ATTR_HOT ATTR_ALWAYS_INLINE int
+alsa_sync_ptr(struct rt_state *__restrict__ rt, unsigned int flags)
+{
+    struct snd_pcm_sync_ptr sptr;
+    sptr.flags = flags;
+    sptr.c.control.appl_ptr = rt->appl_ptr;
+    sptr.c.control.avail_min = rt->period_frames;
+
+    if (unlikely(ioctl(rt_get_alsa_fd(rt), SNDRV_PCM_IOCTL_SYNC_PTR, &sptr) < 0)) {
+        int err = -errno;
+        rt->known_avail = 0;
+        if (err == -EPIPE)
+            rt->pcm_state = (uint8_t)SND_PCM_STATE_XRUN;
+        else if (err == -ESTRPIPE)
+            rt->pcm_state = (uint8_t)SND_PCM_STATE_SUSPENDED;
+        return err;
+    }
+
+    if (flags & SNDRV_PCM_SYNC_PTR_APPL)
+        rt->appl_ptr = sptr.c.control.appl_ptr;
+    const snd_pcm_uframes_t hw_ptr = sptr.s.status.hw_ptr;
+    rt->pcm_state = (uint8_t)sptr.s.status.state;
+
+    snd_pcm_uframes_t hw_avail = (rt->appl_ptr >= hw_ptr)
+        ? (rt->appl_ptr - hw_ptr)
+        : (rt->appl_ptr + rt->boundary - hw_ptr);
+    rt->known_avail = (hw_avail < (snd_pcm_uframes_t)rt->buffer_frames)
+        ? (size_t)((snd_pcm_uframes_t)rt->buffer_frames - hw_avail)
+        : 0;
+    return 0;
+}
+
+static ATTR_HOT ATTR_ALWAYS_INLINE int
+alsa_direct_prepare(struct rt_state *__restrict__ rt)
+{
+    if (unlikely(ioctl(rt_get_alsa_fd(rt), SNDRV_PCM_IOCTL_PREPARE) < 0))
+        return -errno;
+    rt->appl_ptr = 0;
+    rt->ring_buf_pos = 0;
+    rt->known_avail = (size_t)rt->buffer_frames;
+    rt->pcm_state = (uint8_t)SND_PCM_STATE_PREPARED;
+    return 0;
+}
+
+static ATTR_HOT ATTR_ALWAYS_INLINE int
+alsa_direct_drop(struct rt_state *__restrict__ rt)
+{
+    if (unlikely(ioctl(rt_get_alsa_fd(rt), SNDRV_PCM_IOCTL_DROP) < 0))
+        return -errno;
+    rt->known_avail = 0;
+    rt->pcm_state = SND_PCM_STATE_SETUP;
+    return 0;
+}
+
+static ATTR_HOT ATTR_ALWAYS_INLINE int
+alsa_direct_start(struct rt_state *__restrict__ rt)
+{
+    if (unlikely(ioctl(rt_get_alsa_fd(rt), SNDRV_PCM_IOCTL_START) < 0))
+        return -errno;
+    rt->pcm_state = SND_PCM_STATE_RUNNING;
+    return 0;
+}
+
+static ATTR_HOT ATTR_ALWAYS_INLINE int
+alsa_direct_recover(struct rt_state *__restrict__ rt, int err)
+{
+    if (err == -EINTR)
+        return 0;
+    if (err == -EPIPE)
+        return alsa_direct_prepare(rt);
+    if (err == -ESTRPIPE) {
+        int res;
+        int pcm_fd = rt_get_alsa_fd(rt);
+        while ((res = ioctl(pcm_fd, SNDRV_PCM_IOCTL_RESUME)) < 0 && errno == EAGAIN) {
+            usleep(1000);
+        }
+        if (res < 0)
+            return alsa_direct_prepare(rt);
+        alsa_sync_ptr(rt, SNDRV_PCM_SYNC_PTR_HWSYNC |
+                          SNDRV_PCM_SYNC_PTR_APPL |
+                          SNDRV_PCM_SYNC_PTR_AVAIL_MIN);
+        return 0;
+    }
+    return err;
+}
+
+/* Rewinds kernel appl_ptr directly via SNDRV_PCM_IOCTL_REWIND and updates ring state
+   branchlessly in userspace without a second SYNC_PTR syscall or modulo division. */
+static ATTR_HOT ATTR_ALWAYS_INLINE snd_pcm_sframes_t
+alsa_direct_rewind(struct rt_state *__restrict__ rt, snd_pcm_uframes_t frames)
+{
+    if (unlikely(frames == 0))
+        return 0;
+
+    snd_pcm_uframes_t kframes = frames;
+    if (unlikely(ioctl(rt_get_alsa_fd(rt), SNDRV_PCM_IOCTL_REWIND, &kframes) < 0))
+        return -errno;
+
+    snd_pcm_sframes_t rewound = (snd_pcm_sframes_t)kframes;
+    if (likely(rewound > 0)) {
+        snd_pcm_uframes_t rew_u = (snd_pcm_uframes_t)rewound;
+        rt->appl_ptr = (rt->appl_ptr >= rew_u)
+            ? (rt->appl_ptr - rew_u)
+            : (rt->appl_ptr + rt->boundary - rew_u);
+
+        size_t buf_frames = (size_t)rt->buffer_frames;
+        size_t rew_sz = (size_t)rew_u;
+        rt->ring_buf_pos = (rt->ring_buf_pos >= rew_sz)
+            ? (rt->ring_buf_pos - rew_sz)
+            : (rt->ring_buf_pos + buf_frames - rew_sz);
+
+        size_t new_avail = rt->known_avail + rew_sz;
+        rt->known_avail = (new_avail > buf_frames) ? buf_frames : new_avail;
+    }
+    return rewound;
+}
+
+/* Zero-overhead direct kernel PCM write replacing snd_pcm_mmap_writei and snd_pcm_writei.
+   In MMAP mode:
+   - Skips pre-write SYNC_PTR ioctl when POLLOUT or prior commit already confirmed space,
+     cutting snd_pcm_stream_lock_irq acquisitions on the isolated USB IRQ core in half.
+   - Uses HWSYNC only on the cold fallback path to query sub-period URB progress.
+   - Enforces non-blocking avail_min lockstep so sub-period URB drains never cause partial writes.
+   - Commits ring buffer wrap-arounds atomically in a single SNDRV_PCM_IOCTL_SYNC_PTR call. */
+static ATTR_HOT ATTR_ALWAYS_INLINE snd_pcm_sframes_t
+alsa_direct_write(struct rt_state *__restrict__ rt, const void *__restrict__ buf,
+                  size_t frames, size_t frame_bytes, bool use_mmap)
+{
+    if (unlikely(frames == 0)) {
+        return 0;
+    }
+
+    uint8_t *const __restrict__ dma_area = rt->dma_area;
+    if (likely(use_mmap && dma_area != NULL)) {
+        if (unlikely(rt->known_avail < frames)) {
+            int err = alsa_sync_ptr(rt, SNDRV_PCM_SYNC_PTR_HWSYNC |
+                                        SNDRV_PCM_SYNC_PTR_APPL |
+                                        SNDRV_PCM_SYNC_PTR_AVAIL_MIN);
+            if (unlikely(err < 0)) {
+                return err;
+            }
+
+            if (unlikely(rt->pcm_state != SND_PCM_STATE_RUNNING &&
+                         rt->pcm_state != SND_PCM_STATE_PREPARED)) {
+                rt->known_avail = 0;
+                if (rt->pcm_state == SND_PCM_STATE_XRUN) {
+                    return -EPIPE;
+                }
+                if (rt->pcm_state == SND_PCM_STATE_SUSPENDED) {
+                    return -ESTRPIPE;
+                }
+                if (rt->pcm_state != SND_PCM_STATE_PAUSED) {
+                    return -EBADFD;
+                }
+            }
+
+            /* Match kernel snd_pcm_lib_write1 non-blocking period lockstep:
+               never slice a period write into micro-chunks when avail < avail_min */
+            if (unlikely(rt->known_avail == 0 ||
+                         (rt->pcm_state == SND_PCM_STATE_RUNNING &&
+                          rt->known_avail < (size_t)rt->period_frames &&
+                          frames > rt->known_avail))) {
+                return -EAGAIN;
+            }
+
+            if (unlikely(frames > rt->known_avail)) {
+                frames = rt->known_avail;
+            }
+        }
+
+        const size_t buf_frames = (size_t)rt->buffer_frames;
+        const size_t pos = rt->ring_buf_pos;
+        const uint8_t *__restrict__ src = (const uint8_t *)buf;
+        uint8_t *const dst = dma_area + (pos * frame_bytes);
+
+        snd_pcm_uframes_t next_appl = rt->appl_ptr + (snd_pcm_uframes_t)frames;
+        if (unlikely(next_appl >= rt->boundary)) {
+            next_appl -= rt->boundary;
+        }
+        rt->appl_ptr = next_appl;
+
+        if (likely(pos + frames <= buf_frames)) {
+            rt->ring_buf_pos = ring_pos_add_fast(pos, frames, buf_frames);
+            memcpy(dst, src, frames * frame_bytes);
+        } else {
+            const size_t first_frames = buf_frames - pos;
+            const size_t first_bytes = first_frames * frame_bytes;
+            const size_t second_frames = frames - first_frames;
+            rt->ring_buf_pos = second_frames;
+            memcpy(dst, src, first_bytes);
+            memcpy(dma_area, src + first_bytes, second_frames * frame_bytes);
+        }
+
+        /* Ensure DMA buffer stores are visible before publishing appl_ptr to the kernel */
+        atomic_thread_fence(memory_order_release);
+
+        int err = alsa_sync_ptr(rt, SNDRV_PCM_SYNC_PTR_AVAIL_MIN);
+        if (unlikely(err < 0))
+            return err;
+
+        if (unlikely(rt->pcm_state != SND_PCM_STATE_RUNNING)) {
+            if (rt->pcm_state == SND_PCM_STATE_XRUN) {
+                rt->known_avail = 0;
+                return -EPIPE;
+            }
+            if (rt->pcm_state == SND_PCM_STATE_SUSPENDED) {
+                rt->known_avail = 0;
+                return -ESTRPIPE;
+            }
+
+            /* Trigger hardware DMA start once start_threshold (buffer_frames) is filled */
+            if (rt->pcm_state == SND_PCM_STATE_PREPARED && rt->known_avail == 0) {
+                err = alsa_direct_start(rt);
+                if (unlikely(err < 0))
+                    return err;
+            }
+        }
+
+        return (snd_pcm_sframes_t)frames;
+    }
+
+    /* Direct kernel RW_INTERLEAVED fallback bypassing libasound */
+    struct snd_xferi xferi;
+    xferi.result = 0;
+    xferi.buf = (void *)buf;
+    xferi.frames = (snd_pcm_uframes_t)frames;
+
+    if (unlikely(ioctl(rt_get_alsa_fd(rt), SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xferi) < 0)) {
+        int err = -errno;
+        if (err == -EPIPE)
+            rt->pcm_state = SND_PCM_STATE_XRUN;
+        else if (err == -ESTRPIPE)
+            rt->pcm_state = SND_PCM_STATE_SUSPENDED;
+        return err;
+    }
+
+    if (likely(xferi.result > 0)) {
+        size_t written_u = (size_t)xferi.result;
+        rt->ring_buf_pos = ring_pos_add_safe(rt->ring_buf_pos, written_u, (size_t)rt->buffer_frames);
+        snd_pcm_uframes_t next_appl = rt->appl_ptr + (snd_pcm_uframes_t)written_u;
+        if (unlikely(next_appl >= rt->boundary))
+            next_appl -= rt->boundary;
+        rt->appl_ptr = next_appl;
+        if (rt->known_avail >= written_u)
+            rt->known_avail -= written_u;
+        else
+            rt->known_avail = 0;
+        if (unlikely(rt->pcm_state == SND_PCM_STATE_PREPARED &&
+                     rt->appl_ptr >= rt->buffer_frames)) {
+            rt->pcm_state = SND_PCM_STATE_RUNNING;
+        }
+    }
+    return xferi.result;
+}
+
 /* Waits for ALSA hardware to become ready or for a command to arrive.
    Bypasses alsa-lib locks entirely by polling the kernel FD directly.
-   Clears ctx->need_poll ONLY when the kernel signals POLLOUT/POLLERR on the PCM FD
+   Clears rt->need_poll ONLY when the kernel signals POLLOUT/POLLERR on the PCM FD
    or when the full period timeout expires.
    Returns true if interrupted by a command. */
-static ATTR_HOT bool
-wait_for_alsa_or_command(struct ctx *__restrict__ ctx, int cmd_efd, int timeout_ms)
+static ATTR_HOT ATTR_ALWAYS_INLINE bool
+wait_for_alsa_or_command(struct rt_state *__restrict__ rt, struct ctx *__restrict__ ctx,
+                         struct pollfd *__restrict__ pfds, int cmd_efd, int timeout_ms)
 {
-    if (unlikely(!ctx || ctx->alsa_fd < 0)) {
-        if (ctx)
-            ctx->need_poll = false;
+    if (unlikely(pfds[0].fd < 0)) {
+        rt->need_poll = false;
         usleep(2000);
         return false;
     }
 
-    struct pollfd pfds[2];
-
-    /* ALSA hardware descriptor directly from kernel */
-    pfds[0].fd = ctx->alsa_fd;
-    pfds[0].events = POLLOUT | POLLERR | POLLNVAL;
-    pfds[0].revents = 0;
-
-    /* Command eventfd */
-    pfds[1].fd = cmd_efd;
-    pfds[1].events = POLLIN;
-    pfds[1].revents = 0;
-
     int ret = poll(pfds, 2, timeout_ms);
 
     if (ret == 0 || (ret > 0 && (pfds[0].revents & (POLLOUT | POLLERR | POLLNVAL)))) {
-        ctx->need_poll = false;
+        rt->need_poll = false;
+        /* When kernel signals POLLOUT without POLLERR, snd_pcm_playback_poll has verified
+           avail >= avail_min (period_frames). Recording this eliminates the pre-write
+           SYNC_PTR ioctl on the next period write. */
+        if (likely(ret > 0 && (pfds[0].revents & POLLOUT) &&
+                   !(pfds[0].revents & (POLLERR | POLLNVAL)))) {
+            if (rt->known_avail < (size_t)rt->period_frames)
+                rt->known_avail = (size_t)rt->period_frames;
+        } else {
+            rt->known_avail = 0;
+        }
     }
 
     /* Interrupted by watcher thread */
@@ -2490,7 +2897,7 @@ wait_for_alsa_or_command(struct ctx *__restrict__ ctx, int cmd_efd, int timeout_
     }
 
     /* Note: If hardware has an XRUN (POLLERR), poll wakes up instantly and clears need_poll.
-       We don't call snd_pcm_recover here; instead we let ALSA_WRITE 
+       We don't call alsa_direct_recover here; instead we let ALSA_WRITE 
        catch it as -EPIPE on the next loop iteration to keep logic centralized. */
     
     return false;
@@ -2498,10 +2905,47 @@ wait_for_alsa_or_command(struct ctx *__restrict__ ctx, int cmd_efd, int timeout_
 
 /* Lock-free helper to sync time base with UI (single release fence pairs with watcher acquire) */
 static ATTR_ALWAYS_INLINE void
-update_sync_base(struct ctx *ctx, size_t silence_frames)
+update_sync_base(struct ctx *ctx, size_t play_frames, size_t silence_frames)
 {
-    atomic_store_explicit(&ctx->sync_audio_frames, ctx->play_frames, memory_order_relaxed);
-    atomic_store_explicit(&ctx->sync_base_frames, ctx->play_frames + silence_frames, memory_order_release);
+    atomic_store_explicit(&ctx->sync_audio_frames, play_frames, memory_order_relaxed);
+    atomic_store_explicit(&ctx->sync_base_frames, play_frames + silence_frames, memory_order_release);
+}
+
+/* Updates monotonic stream boundary registers only while decoding/warming is still in progress.
+   Once the track is fully buffered, locks *locked_limit so subsequent calls return in 1 instruction (cbnz). */
+static ATTR_HOT ATTR_ALWAYS_INLINE size_t
+refresh_stream_limits(const struct ctx *__restrict__ ctx,
+                      const struct player_ctrl *__restrict__ local_shm,
+                      size_t data_frames,
+                      uint64_t *__restrict__ cached_exact_total,
+                      size_t *__restrict__ cached_live_frames,
+                      size_t *__restrict__ locked_limit)
+{
+    size_t limit = *locked_limit;
+    if (likely(limit != 0))
+        return limit;
+
+    uint64_t exact = *cached_exact_total;
+    if (exact == 0 && local_shm != NULL) {
+        exact = atomic_load_explicit(&local_shm->exact_total_frames, memory_order_acquire);
+        *cached_exact_total = exact;
+    }
+
+    size_t full_target = (exact > 0 && (data_frames == 0 || (size_t)exact < data_frames))
+        ? (size_t)exact
+        : data_frames;
+
+    size_t live = *cached_live_frames;
+    if (full_target == 0 || live < full_target) {
+        live = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
+        *cached_live_frames = live;
+    }
+
+    limit = (full_target > 0 && live > full_target) ? full_target : live;
+    if (exact > 0 && full_target > 0 && live >= full_target) {
+        *locked_limit = full_target;
+    }
+    return limit;
 }
 
 /* --- PLAYBACK LOOP (CHILD) --- */
@@ -2522,8 +2966,8 @@ typedef enum {
 static ATTR_HOT int
 play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
 {
-#define ALSA_WRITE(pcm, buf, size) \
-    (likely(use_mmap) ? snd_pcm_mmap_writei(pcm, buf, size) : snd_pcm_writei(pcm, buf, size))
+#define ALSA_WRITE(pcm_unused, buf, size) \
+    alsa_direct_write(&rt, (buf), (size), frame_bytes, use_mmap)
 
     /* Hoist invariant audio parameters into CPU registers to prevent pointer-aliasing reloads */
     const size_t frame_bytes = ctx->frame_bytes;
@@ -2534,11 +2978,26 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
     size_t chunk_frames = cmd->period_size;
     size_t total_buffer_frames = cmd->period_size * cmd->period_count;
 
-    
     /* Hardware constraint safeguard */
     if (chunk_frames == 0 || chunk_frames > total_buffer_frames) {
         chunk_frames = total_buffer_frames / 2; 
     }
+
+    /* Non-escaping local RT ring state: promoted entirely to CPU registers via SROA.
+       Initializing period_frames from chunk_frames allows GVN to share a single register. */
+    struct rt_state rt = {
+        .dma_area      = ctx->init_dma_area,
+        .appl_ptr      = 0,
+        .boundary      = ctx->init_boundary,
+        .ring_buf_pos  = 0,
+        .known_avail   = (size_t)ctx->init_buffer_frames,
+        .buffer_frames = ctx->init_buffer_frames,
+        .period_frames = (uint32_t)chunk_frames,
+        .rt_alsa_fd    = ctx->init_alsa_fd,
+        .pcm_state     = (uint8_t)SND_PCM_STATE_PREPARED,
+        .need_poll     = false,
+        .zero_silence  = ctx->zero_silence
+    };
 
     /* L1 cache line (64B) and RAM page (4096B) alignment steps via GCD */
     size_t cache_frames = 1;
@@ -2582,37 +3041,57 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
     safety_margin = ((safety_margin + page_step - 1) / page_step) * page_step;
 
     init_shm(data_frames, cmd);
+    struct player_ctrl *const __restrict__ local_shm = shm;
+
+    /* Monotonic stream boundary caches: eliminate Cache Line 2 and SHM acquire loads once buffered */
+    uint64_t cached_exact_total = local_shm
+        ? atomic_load_explicit(&local_shm->exact_total_frames, memory_order_acquire)
+        : 0;
+    if (cached_exact_total == 0 && cmd->expected_size == 0) {
+        cached_exact_total = data_frames;
+    }
+    size_t cached_live_frames = 0;
+    size_t locked_limit = 0;
+    (void)refresh_stream_limits(ctx, local_shm, data_frames,
+                                &cached_exact_total, &cached_live_frames,
+                                &locked_limit);
+
+    /* Keep main audio cursor in a dedicated CPU register across the entire RT loop */
+    size_t play_frames = 0;
 
     /* Initial seek logic for settings reload */
     if (cmd->initial_seek > 0) {
         size_t target_frames = (size_t)cmd->initial_seek;
-        size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
-        uint64_t exact_init = shm ? atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire) : 0;
+        size_t live_frames = cached_live_frames;
+        uint64_t exact_init = cached_exact_total;
         
-        if (target_frames > live_frames)
+        if (target_frames > live_frames) {
             target_frames = live_frames;
+        }
 
-        if (data_frames > 0 && target_frames > data_frames) 
+        if (data_frames > 0 && target_frames > data_frames) {
             target_frames = data_frames;
+        }
 
-        if (exact_init > 0 && target_frames > (size_t)exact_init)
+        if (exact_init > 0 && target_frames > (size_t)exact_init) {
             target_frames = (size_t)exact_init;
+        }
 
         target_frames = (target_frames / cache_frames) * cache_frames;
             
-        ctx->play_frames = target_frames;
-        update_sync_base(ctx, 0);
+        play_frames = target_frames;
+        update_sync_base(ctx, play_frames, 0);
 
-        if (shm) {
-            atomic_store_explicit(&shm->current_frame, target_frames, memory_order_release);
+        if (local_shm) {
+            atomic_store_explicit(&local_shm->current_frame, target_frames, memory_order_release);
         }
     }
 
     setup_child_signals();
 
     /* Notify client that hardware is initializing */
-    if (shm)
-        atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
+    if (local_shm)
+        atomic_store_explicit(&local_shm->state, STATE_PAUSED, memory_order_release);
 
     /* Calculate dynamic fade duration strictly snapped to RAM page boundary */
     size_t optimal_fade_frames = (cmd->rate * 50) / 1000; 
@@ -2634,8 +3113,8 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
     void *silence_buf = NULL;
     if (posix_memalign(&silence_buf, 64, max_period_bytes) != 0) {
         fprintf(stderr, "Fatal: Failed to allocate aligned silence buffer\n");
-        if (shm)
-            atomic_store_explicit(&shm->state, STATE_ERROR, memory_order_release);
+        if (local_shm)
+            atomic_store_explicit(&local_shm->state, STATE_ERROR, memory_order_release);
         if (g_shm_fd >= 0) {
             close(g_shm_fd);
             g_shm_fd = -1;
@@ -2652,8 +3131,8 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
     if (posix_memalign((void **)&rt_fade_buf, 64, max_rt_frames * frame_bytes) != 0) {
         fprintf(stderr, "Fatal: Failed to allocate aligned RT fade buffer\n");
         free(silence_buf);
-        if (shm)
-            atomic_store_explicit(&shm->state, STATE_ERROR, memory_order_release);
+        if (local_shm)
+            atomic_store_explicit(&local_shm->state, STATE_ERROR, memory_order_release);
         if (g_shm_fd >= 0) {
             close(g_shm_fd);
             g_shm_fd = -1;
@@ -2678,8 +3157,8 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
     /* Start background services */
     int cmd_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
-    atomic_init(&ctx->sync_base_frames, ctx->play_frames);
-    atomic_init(&ctx->sync_audio_frames, ctx->play_frames);
+    atomic_init(&ctx->sync_base_frames, play_frames);
+    atomic_init(&ctx->sync_audio_frames, play_frames);
     atomic_init(&ctx->bg_evicted_count, 0);
     pthread_t main_tid = pthread_self(); 
     struct watcher_args wargs = { .main_tid = main_tid, .ctx = ctx, .cmd = cmd, .cmd_efd = cmd_efd };
@@ -2689,7 +3168,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
     bool watcher_started = false;
     bool warmer_started = false;
     
-    if (shm && pthread_create(&watcher_tid, NULL, shm_watcher_thread, &wargs) == 0) {
+    if (local_shm && pthread_create(&watcher_tid, NULL, shm_watcher_thread, &wargs) == 0) {
         watcher_started = true;
         expected_bg_threads++;
     }
@@ -2737,83 +3216,94 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
         wakeup_frames = cmd->period_size;
     }
 
-    ctx->is_cruising = false;
-    ctx->need_poll = false;
-    ctx->continuous_frames = 0;
-    ctx->cruise_delay = 0;
-    ctx->ring_period_pos = 0;
+    /* Pure RT loop state kept in CPU registers and pre-initialized pollfd table */
+    bool is_cruising = false;
+    size_t continuous_frames = 0;
+    long cruise_delay = 0;
+    size_t ring_period_pos = 0;
+    rt.need_poll = false;
+
+    struct pollfd rt_pfds[2] = {
+        { .fd = rt.rt_alsa_fd, .events = POLLOUT, .revents = 0 },
+        { .fd = cmd_efd,       .events = POLLIN,  .revents = 0 }
+    };
 
     /* DAC warm-up using pre-filled silence_buf without dirtying L1/L2 cache */
-    if (ctx->pcm) {
+    if (rt.rt_alsa_fd >= 0) {
         snd_pcm_sframes_t w_warm = ALSA_WRITE(ctx->pcm, silence_buf, wakeup_frames);
         if (w_warm > 0) {
-            ctx->continuous_frames += (size_t)w_warm;
-            ctx->ring_period_pos = ring_pos_add_fast(ctx->ring_period_pos, (size_t)w_warm, chunk_frames);
+            continuous_frames += (size_t)w_warm;
+            ring_period_pos = ring_pos_add_fast(ring_period_pos, (size_t)w_warm, chunk_frames);
         }
 
         /* Apply smooth fade-in when starting mid-track (-s / initial_seek) */
         if (cmd->initial_seek > 0) {
-            uint64_t exact_init = shm ? atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire) : 0;
-            size_t live_f = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
-            size_t avail_f = (live_f > ctx->play_frames) ? (live_f - ctx->play_frames) : 0;
+            size_t limit_f = refresh_stream_limits(ctx, local_shm, data_frames,
+                                                   &cached_exact_total, &cached_live_frames,
+                                                   &locked_limit);
+            size_t avail_f = (limit_f > play_frames) ? (limit_f - play_frames) : 0;
             
-            if (data_frames > 0 && avail_f > (data_frames - ctx->play_frames)) {
-                avail_f = data_frames - ctx->play_frames;
-            }
-            if (exact_init > 0) {
-                size_t exact_rem = (exact_init > ctx->play_frames) ? ((size_t)exact_init - ctx->play_frames) : 0;
-                if (avail_f > exact_rem) {
-                    avail_f = exact_rem;
-                }
-            }
-            
-            size_t free_buf_f = (total_buffer_frames > ctx->continuous_frames) ?
-                                (total_buffer_frames - ctx->continuous_frames) : 0;
+            size_t free_buf_f = (total_buffer_frames > continuous_frames) ?
+                                (total_buffer_frames - continuous_frames) : 0;
             size_t fi_f = optimal_fade_frames;
-            if (fi_f > avail_f)
+            if (fi_f > avail_f) {
                 fi_f = avail_f;
-            if (fi_f > free_buf_f)
+            }
+            if (fi_f > free_buf_f) {
                 fi_f = free_buf_f;
+            }
             fi_f = (fi_f / cache_frames) * cache_frames;
             
             if (fi_f > 0) {
-                memcpy(rt_fade_buf, data_start + (ctx->play_frames * frame_bytes), fi_f * frame_bytes);
+                memcpy(rt_fade_buf, data_start + (play_frames * frame_bytes), fi_f * frame_bytes);
                 apply_fade(rt_fade_buf, fi_f, cmd, true);
                 
                 snd_pcm_sframes_t w = ALSA_WRITE(ctx->pcm, rt_fade_buf, fi_f);
                 if (w > 0) {
-                    ctx->play_frames += (size_t)w;
-                    ctx->continuous_frames += (size_t)w;
-                    ctx->ring_period_pos = ring_pos_add_safe(ctx->ring_period_pos, (size_t)w, chunk_frames);
-                    update_sync_base(ctx, 0);
+                    play_frames += (size_t)w;
+                    continuous_frames += (size_t)w;
+                    ring_period_pos = ring_pos_add_safe(ring_period_pos, (size_t)w, chunk_frames);
+                    update_sync_base(ctx, play_frames, 0);
                 }
             }
         }
+
+        /* Publish STATE_PLAYING once before entering SM_PLAYING to avoid per-period state checks */
+        if (local_shm) {
+            atomic_store_explicit(&local_shm->state, STATE_PLAYING, memory_order_release);
+        }
     }
 
-    /* Main state machine loop (relaxed load avoids seq_cst fence on every audio period) */
+    /* Main state machine loop (relaxed loads avoid acquire/seq_cst stalls on every audio period) */
     while (likely(!atomic_load_explicit(&stop_flag, memory_order_relaxed) && !track_completed)) {
 
-        /* Process commands */
-        if (unlikely(atomic_load_explicit(&signal_event, memory_order_acquire) || 
-            (shm && atomic_load_explicit(&shm->command, memory_order_acquire) != CMD_NONE))) {
-            
-            atomic_store_explicit(&signal_event, 0, memory_order_release);
+        /* Process commands (ignore CMD_UPDATE_TIME which is handled asynchronously by watcher) */
+        int c = likely(local_shm != NULL)
+            ? atomic_load_explicit(&local_shm->command, memory_order_relaxed)
+            : CMD_NONE;
+        int sig_ev = atomic_load_explicit(&signal_event, memory_order_relaxed);
+
+        if (unlikely((c != CMD_NONE && c != CMD_UPDATE_TIME) || sig_ev != 0)) {
+            atomic_thread_fence(memory_order_acquire);
+
+            if (unlikely(sig_ev != 0)) {
+                atomic_store_explicit(&signal_event, 0, memory_order_release);
+            }
             
             /* Flush non-blocking eventfd only if watcher actually armed it */
             if (atomic_load_explicit(&ctx->wake_pending, memory_order_acquire)) {
                 ack_cmd_efd(ctx, cmd_efd);
             }
             
-            if (shm) {
-                int c = atomic_load_explicit(&shm->command, memory_order_acquire);
+            if (local_shm) {
+                c = atomic_load_explicit(&local_shm->command, memory_order_relaxed);
             
                 if (c == CMD_EXIT) {
                     int expected_cmd = CMD_EXIT;
-                    atomic_compare_exchange_strong_explicit(&shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
+                    atomic_compare_exchange_strong_explicit(&local_shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
                     resume_pending = false;
                     
-                    if (ctx->pcm && (sm_state == SM_PLAYING || sm_state == SM_DRAINING || sm_state == SM_RESUMING)) {
+                    if (rt.rt_alsa_fd >= 0 && (sm_state == SM_PLAYING || sm_state == SM_DRAINING || sm_state == SM_RESUMING)) {
                         fade_is_exit = true;
                         sm_state = SM_FADING_OUT_INIT;
                         continue; 
@@ -2827,7 +3317,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                 } else if (c == CMD_PAUSE) {
                     /* Consume command to CMD_NONE immediately to prevent eventfd ping-pong */
                     int expected_cmd = CMD_PAUSE;
-                    atomic_compare_exchange_strong_explicit(&shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
+                    atomic_compare_exchange_strong_explicit(&local_shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
                     resume_pending = false;
                     
                     if (sm_state == SM_PLAYING || sm_state == SM_DRAINING) {
@@ -2835,7 +3325,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                         sm_state = SM_FADING_OUT_INIT;
                         continue;
                     } else if (sm_state == SM_RESUMING) {
-                        if (ctx->pcm) {
+                        if (rt.rt_alsa_fd >= 0) {
                             fade_is_exit = false;
                             sm_state = SM_FADING_OUT_INIT;
                         } else {
@@ -2845,14 +3335,14 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                                 reset_process_priority();
                                 sys_isolated = false;
                             }
-                            atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
+                            atomic_store_explicit(&local_shm->state, STATE_PAUSED, memory_order_release);
                             sm_state = SM_SLEEPING;
                         }
                         continue;
                     }
                 } else if (c == CMD_RESUME) {
                     int expected_cmd = CMD_RESUME;
-                    atomic_compare_exchange_strong_explicit(&shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
+                    atomic_compare_exchange_strong_explicit(&local_shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
                     
                     if (sm_state == SM_SLEEPING) {
                         sm_state = SM_RESUMING;
@@ -2866,15 +3356,18 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     int expected_cmd = CMD_SEEK;
                     
                     /* Exclusively acquire command via CAS */
-                    if (atomic_compare_exchange_strong_explicit(&shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed)) {
+                    if (atomic_compare_exchange_strong_explicit(&local_shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed)) {
                         
-                        uint64_t target_frame = atomic_load_explicit(&shm->seek_target, memory_order_acquire);
-                        uint64_t total_frames = atomic_load_explicit(&shm->total_frames, memory_order_acquire);
-                        uint64_t exact_total = atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire);
+                        uint64_t target_frame = atomic_load_explicit(&local_shm->seek_target, memory_order_acquire);
+                        uint64_t total_frames = atomic_load_explicit(&local_shm->total_frames, memory_order_acquire);
+                        size_t live_frames = refresh_stream_limits(ctx, local_shm, data_frames,
+                                                                   &cached_exact_total, &cached_live_frames,
+                                                                   &locked_limit);
+                        uint64_t exact_total = cached_exact_total;
 
                         if (target_frame >= total_frames || (exact_total > 0 && target_frame >= exact_total)) {
-                            if (ctx->pcm) {
-                                snd_pcm_drop(ctx->pcm); 
+                            if (rt.rt_alsa_fd >= 0) {
+                                alsa_direct_drop(&rt); 
                             }
                             track_completed = true; 
                             break; 
@@ -2887,13 +3380,6 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                         resume_pending = false;
 
                         size_t target_frames = (size_t)target_frame;
-                        size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
-                        if (exact_total > 0 && live_frames > (size_t)exact_total) {
-                            live_frames = (size_t)exact_total;
-                        }
-                        if (data_frames > 0 && live_frames > data_frames) {
-                            live_frames = data_frames;
-                        }
                         
                         if (target_frames > live_frames) {
                             target_frames = live_frames;
@@ -2901,12 +3387,12 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                         
                         target_frames = (target_frames / cache_frames) * cache_frames;
 
-                        if (ctx->pcm) {
+                        if (rt.rt_alsa_fd >= 0) {
                             size_t fade_frames = optimal_fade_frames;
                             size_t fade_bytes = fade_frames * frame_bytes;
                             size_t total_splice_frames = fade_frames * 2;
                             size_t avail_new = (live_frames > target_frames) ? (live_frames - target_frames) : 0;
-                            long delay_frames = get_safe_alsa_delay(ctx, cmd);
+                            long delay_frames = get_safe_alsa_delay(&rt);
                             long min_delay_for_rewind = (long)(safety_margin + total_splice_frames);
                             bool rewound = false;
 
@@ -2917,27 +3403,27 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                             if (sm_state == SM_PLAYING &&
                                 avail_new >= fade_frames &&
                                 chunk_frames >= (safety_margin + total_splice_frames) &&
-                                snd_pcm_state(ctx->pcm) == SND_PCM_STATE_RUNNING &&
+                                rt.pcm_state == SND_PCM_STATE_RUNNING &&
                                 delay_frames > min_delay_for_rewind) {
                                 unsigned long rewind_amount = (unsigned long)(delay_frames - (long)safety_margin);
                                 rewind_amount = (rewind_amount / page_step) * page_step;
                                 
                                 if (rewind_amount >= total_splice_frames) {
-                                    snd_pcm_sframes_t actually_rewound = snd_pcm_rewind(ctx->pcm, rewind_amount);
+                                    snd_pcm_sframes_t actually_rewound = alsa_direct_rewind(&rt, rewind_amount);
                                     
                                     if (actually_rewound == (snd_pcm_sframes_t)rewind_amount) {
                                         rewound = true;
                                         size_t rew_mod = (size_t)actually_rewound % chunk_frames;
-                                        ctx->ring_period_pos = ring_pos_add_fast(ctx->ring_period_pos,
-                                                                                 chunk_frames - rew_mod,
-                                                                                 chunk_frames);
+                                        ring_period_pos = ring_pos_add_fast(ring_period_pos,
+                                                                            chunk_frames - rew_mod,
+                                                                            chunk_frames);
 
-                                        size_t stream_pos = ctx->play_frames + prior_silence;
+                                        size_t stream_pos = play_frames + prior_silence;
                                         size_t rewound_pos = (stream_pos >= (size_t)actually_rewound) ?
                                                              (stream_pos - (size_t)actually_rewound) : 0;
                                         
                                         /* 1. Crossfade out the old audio tail into rt_fade_buf[0 .. fade_frames) */
-                                        if (rewound_pos < ctx->play_frames) {
+                                        if (rewound_pos < play_frames) {
                                             size_t old_tail_frames = (rewound_pos / cache_frames) * cache_frames;
                                             size_t avail_old = (live_frames > old_tail_frames) ? (live_frames - old_tail_frames) : 0;
                                             if (avail_old >= fade_frames) {
@@ -2945,10 +3431,10 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                                                 memcpy(rt_fade_buf, data_ptr, fade_bytes);
                                                 apply_fade(rt_fade_buf, fade_frames, cmd, false);
                                             } else {
-                                                snd_pcm_format_set_silence(cmd->format, rt_fade_buf, fade_frames * cmd->channels);
+                                                rt_set_silence(&rt, rt_fade_buf, fade_frames, frame_bytes, cmd);
                                             }
                                         } else {
-                                            snd_pcm_format_set_silence(cmd->format, rt_fade_buf, fade_frames * cmd->channels);
+                                            rt_set_silence(&rt, rt_fade_buf, fade_frames, frame_bytes, cmd);
                                         }
 
                                         /* 2. Crossfade in the new target audio into rt_fade_buf[fade_frames .. 2*fade_frames) */
@@ -2960,15 +3446,15 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                                         /* 3. Single atomic write of the entire page-aligned crossfade splice */
                                         snd_pcm_sframes_t w_splice = ALSA_WRITE(ctx->pcm, rt_fade_buf, total_splice_frames);
                                         size_t actual_splice = (w_splice > 0) ? (size_t)w_splice : 0;
-                                        ctx->ring_period_pos = ring_pos_add_safe(ctx->ring_period_pos, actual_splice, chunk_frames);
+                                        ring_period_pos = ring_pos_add_safe(ring_period_pos, actual_splice, chunk_frames);
 
                                         size_t actual_in = (actual_splice > fade_frames) ? (actual_splice - fade_frames) : 0;
-                                        ctx->play_frames = target_frames + actual_in;
-                                        update_sync_base(ctx, 0);
+                                        play_frames = target_frames + actual_in;
+                                        update_sync_base(ctx, play_frames, 0);
 
                                         size_t rem_in_buf = ((size_t)delay_frames > (size_t)actually_rewound) ?
                                                             ((size_t)delay_frames - (size_t)actually_rewound) : 0;
-                                        ctx->continuous_frames = rem_in_buf + actual_splice;
+                                        continuous_frames = rem_in_buf + actual_splice;
                                     }
                                 }
                             }
@@ -2977,9 +3463,9 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                                Writes only optimal_fade_frames (~8 KB) via rt_fade_buf to preserve L1/L2 cache;
                                SM_PLAYING immediately fills the rest of the buffer zero-copy from current appl_ptr. */
                             if (!rewound) {
-                                snd_pcm_drop(ctx->pcm);
-                                snd_pcm_prepare(ctx->pcm);
-                                ctx->ring_period_pos = 0;
+                                alsa_direct_drop(&rt);
+                                alsa_direct_prepare(&rt);
+                                ring_period_pos = 0;
 
                                 size_t fi_frames = optimal_fade_frames;
                                 if (fi_frames > avail_new)
@@ -2999,43 +3485,43 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                                         written = ALSA_WRITE(ctx->pcm, rt_fade_buf, fi_frames);
                                         if (written == -EAGAIN) {
                                             /* Yield to eventfd to prevent hot polling */
-                                            wait_for_alsa_or_command(ctx, cmd_efd, 2); 
+                                            wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, 2); 
                                             retries++;
                                         }
                                     } while (written == -EAGAIN && retries < 10);
                                     
                                     if (written == -EPIPE || written == -ESTRPIPE) {
-                                        snd_pcm_recover(ctx->pcm, written, 1);
+                                        alsa_direct_recover(&rt, (int)written);
                                         written = 0; 
                                     }
                                 }
 
                                 size_t actual_written_audio = (written > 0) ? (size_t)written : 0;
 
-                                ctx->play_frames = target_frames + actual_written_audio;
-                                ctx->continuous_frames = actual_written_audio;
-                                ctx->ring_period_pos = ring_pos_add_safe(0, actual_written_audio, chunk_frames);
-                                update_sync_base(ctx, 0);
+                                play_frames = target_frames + actual_written_audio;
+                                continuous_frames = actual_written_audio;
+                                ring_period_pos = ring_pos_add_safe(0, actual_written_audio, chunk_frames);
+                                update_sync_base(ctx, play_frames, 0);
                             }
                             
-                            atomic_store_explicit(&shm->current_frame, target_frames, memory_order_release);
-                            atomic_store_explicit(&shm->state, STATE_PLAYING, memory_order_release);
+                            atomic_store_explicit(&local_shm->current_frame, target_frames, memory_order_release);
+                            atomic_store_explicit(&local_shm->state, STATE_PLAYING, memory_order_release);
                             
-                            ctx->is_cruising = false;
-                            ctx->need_poll = false;
-                            ctx->cruise_delay = 0;
+                            is_cruising = false;
+                            rt.need_poll = false;
+                            cruise_delay = 0;
                             
                             fade_is_exit = false;
                             sm_state = SM_PLAYING;
                         } else {
                             /* Device is paused or waiting to reopen in SM_RESUMING */
-                            ctx->play_frames = target_frames;
-                            update_sync_base(ctx, 0);
-                            atomic_store_explicit(&shm->current_frame, target_frames, memory_order_release);
+                            play_frames = target_frames;
+                            update_sync_base(ctx, play_frames, 0);
+                            atomic_store_explicit(&local_shm->current_frame, target_frames, memory_order_release);
                             
                             if (sm_state != SM_RESUMING) {
                                 /* Update state for JNI. Never mutate command channel internally. */
-                                atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
+                                atomic_store_explicit(&local_shm->state, STATE_PAUSED, memory_order_release);
                                 sm_state = SM_SLEEPING;
                             }
                         }
@@ -3047,39 +3533,32 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
         /* State machine execution */
         switch (sm_state) {
         case SM_PLAYING: {
-            /* Safety check */
-            if (unlikely(!ctx->pcm)) {
+            /* Safety check using register-promoted rt.rt_alsa_fd (avoids touching cold Cache Line 2 ctx->pcm) */
+            if (unlikely(rt.rt_alsa_fd < 0)) {
                 sm_state = SM_RESUMING;
                 break;
             }
 
             /* Guard against spurious cmd_efd / EINTR wakeups: never call ALSA_WRITE
                until the kernel FD genuinely signals POLLOUT (avail >= period_size) */
-            if (unlikely(ctx->need_poll)) {
-                if (wait_for_alsa_or_command(ctx, cmd_efd, timeout_ms))
+            if (unlikely(rt.need_poll)) {
+                if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms))
                     break;
-                if (ctx->need_poll)
+                if (rt.need_poll)
                     break;
             }
 
-            /* Read exact total frames declared by JNI */
-            uint64_t exact_total = 0;
-            if (likely(shm != NULL))
-                exact_total = atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire);
+            /* Query atomic stream boundaries ONLY while decoding/warming is still in progress.
+               Once buffered, returns locked_limit in 1 instruction with zero Cache Line 1/2 reads. */
+            size_t limit_frames = refresh_stream_limits(ctx, local_shm, data_frames,
+                                                        &cached_exact_total, &cached_live_frames,
+                                                        &locked_limit);
 
-            /* Determine available frames via branchless upper-bound clamping */
-            size_t limit_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
-            if (data_frames > 0 && limit_frames > data_frames)
-                limit_frames = data_frames;
-            if (unlikely(exact_total > 0) && limit_frames > (size_t)exact_total)
-                limit_frames = (size_t)exact_total;
-
-            const size_t play_frames = ctx->play_frames;
             size_t available_frames = (limit_frames > play_frames) ? (limit_frames - play_frames) : 0;
 
             if (unlikely(!available_frames)) {
                 /* Handle EOF or expected file end */
-                if ((exact_total > 0 && play_frames >= exact_total) || 
+                if ((cached_exact_total > 0 && play_frames >= cached_exact_total) || 
                     (data_frames > 0 && play_frames >= data_frames)) {
                     
                     /* Transition to DRAINING:
@@ -3089,17 +3568,17 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     if (silence_frames_written >= 64) {
                         silence_frames_needed = silence_frames_written;
                     } else {
-                        silence_frames_needed = silence_frames_written + cmd->period_size;
+                        silence_frames_needed = silence_frames_written + chunk_frames;
                     }
 
-                    if (shm)
-                        atomic_store_explicit(&shm->state, STATE_DRAINING, memory_order_release);
+                    if (local_shm)
+                        atomic_store_explicit(&local_shm->state, STATE_DRAINING, memory_order_release);
                     
                     sm_state = SM_DRAINING;
                     continue;
                 } else {
                     /* Wait for JNI or warmer_thread; resync delay on next write */
-                    ctx->is_cruising = false;
+                    is_cruising = false;
                     usleep(1000);
                     continue;
                 }
@@ -3110,12 +3589,12 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                   exact remainder of the current hardware period so appl_ptr locks onto [0, period_size).
                2. During PREPARED fill, cap to total_buffer_frames so start_threshold is hit cleanly. */
             size_t target_chunk = chunk_frames;
-            if (unlikely(ctx->ring_period_pos != 0)) {
-                target_chunk = chunk_frames - ctx->ring_period_pos;
+            if (unlikely(ring_period_pos != 0)) {
+                target_chunk = chunk_frames - ring_period_pos;
             }
-            if (unlikely(!ctx->is_cruising && ctx->continuous_frames < total_buffer_frames &&
-                         snd_pcm_state(ctx->pcm) == SND_PCM_STATE_PREPARED)) {
-                size_t rem_to_fill = total_buffer_frames - ctx->continuous_frames;
+            if (unlikely(!is_cruising && continuous_frames < total_buffer_frames &&
+                         rt.pcm_state == SND_PCM_STATE_PREPARED)) {
+                size_t rem_to_fill = total_buffer_frames - continuous_frames;
                 if (target_chunk > rem_to_fill) {
                     target_chunk = rem_to_fill;
                 }
@@ -3132,7 +3611,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
 
             /* Handle incomplete periods */
             if (unlikely(frames_to_write < target_chunk)) {
-                if (exact_total > 0 && (play_frames + frames_to_write) >= exact_total) {
+                if (cached_exact_total > 0 && (play_frames + frames_to_write) >= cached_exact_total) {
                     is_true_eof = true;
                 } else if (data_frames > 0 && (play_frames + frames_to_write) >= data_frames) {
                     is_true_eof = true;
@@ -3144,13 +3623,13 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     size_t pad_in_chunk = target_chunk - frames_to_write;
                     
                     memcpy(rt_fade_buf, raw_data_ptr, bytes_to_copy);
-                    snd_pcm_format_set_silence(cmd->format, rt_fade_buf + bytes_to_copy, pad_in_chunk * cmd->channels);
+                    rt_set_silence(&rt, rt_fade_buf + bytes_to_copy, pad_in_chunk, frame_bytes, cmd);
                     
                     data_ptr = rt_fade_buf;
                     frames_to_write = target_chunk;
                 } else {
                     /* Stream is live, yield and wait for JNI; resync delay on next write */
-                    ctx->is_cruising = false;
+                    is_cruising = false;
                     usleep(1000);
                     continue;
                 }
@@ -3160,15 +3639,15 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
 
             if (unlikely(written_frames < 0)) {
                 /* Proactive command check: exit ALSA loop immediately if a signal is received */
-                int current_cmd = shm ? atomic_load_explicit(&shm->command, memory_order_acquire) : CMD_NONE;
+                int current_cmd = local_shm ? atomic_load_explicit(&local_shm->command, memory_order_acquire) : CMD_NONE;
                 if (current_cmd == CMD_PAUSE || current_cmd == CMD_SEEK || current_cmd == CMD_EXIT ||
                     atomic_load_explicit(&signal_event, memory_order_acquire)) {
                     break;  
                 }
 
                 if (written_frames == -EAGAIN) {
-                    ctx->need_poll = true;
-                    if (wait_for_alsa_or_command(ctx, cmd_efd, timeout_ms))
+                    rt.need_poll = true;
+                    if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms))
                         break;
                     continue;
                 }
@@ -3178,17 +3657,17 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                 }
 
                 if (written_frames == -EPIPE || written_frames == -ESTRPIPE) {
-                    if (snd_pcm_recover(ctx->pcm, written_frames, 1) != 0) {
+                    if (alsa_direct_recover(&rt, (int)written_frames) != 0) {
                         is_hw_error = true;
                         atomic_store_explicit(&stop_flag, 1, memory_order_release);
                         break;
                     }
                     
-                    ctx->is_cruising = false;
-                    ctx->need_poll = false;
-                    ctx->continuous_frames = 0;
-                    ctx->cruise_delay = 0;
-                    ctx->ring_period_pos = 0;
+                    is_cruising = false;
+                    rt.need_poll = false;
+                    continuous_frames = 0;
+                    cruise_delay = 0;
+                    ring_period_pos = 0;
                     eof_padded_silence = 0;
                     
                     /* XRUN recovery: apply software fade-in from raw_data_ptr (never from rt_fade_buf) */
@@ -3205,10 +3684,10 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                         
                         snd_pcm_sframes_t rec_write = ALSA_WRITE(ctx->pcm, rt_fade_buf, fade_frames);
                         if (rec_write > 0) {
-                            ctx->play_frames = play_frames + (size_t)rec_write;
-                            ctx->continuous_frames = (size_t)rec_write;
-                            ctx->ring_period_pos = ring_pos_add_safe(0, (size_t)rec_write, chunk_frames);
-                            update_sync_base(ctx, 0);
+                            play_frames += (size_t)rec_write;
+                            continuous_frames = (size_t)rec_write;
+                            ring_period_pos = ring_pos_add_safe(0, (size_t)rec_write, chunk_frames);
+                            update_sync_base(ctx, play_frames, 0);
                         }
                     }
                     continue;
@@ -3225,83 +3704,79 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                 size_t audio_adv = (written_u > actual_audio_in_chunk) ? actual_audio_in_chunk : written_u;
                 size_t pad_adv = written_u - audio_adv;
 
-                ctx->play_frames = play_frames + audio_adv;
+                play_frames += audio_adv;
                 eof_padded_silence += pad_adv;
-                ctx->ring_period_pos = ring_pos_add_fast(ctx->ring_period_pos, written_u, chunk_frames);
-                update_sync_base(ctx, eof_padded_silence);
+                ring_period_pos = ring_pos_add_fast(ring_period_pos, written_u, chunk_frames);
+                update_sync_base(ctx, play_frames, eof_padded_silence);
                 
-                bool wait_for_period = ctx->is_cruising;
+                bool wait_for_period = is_cruising;
                 long delay_frames = 0;
 
-                if (unlikely(!ctx->is_cruising)) {
+                if (unlikely(!is_cruising)) {
                     /* Ramp-up phase: buffer is filling. Poll hardware delay via ioctl syscall. */
-                    delay_frames = get_safe_alsa_delay(ctx, cmd);
-                    ctx->continuous_frames += written_u;
+                    delay_frames = get_safe_alsa_delay(&rt);
+                    continuous_frames += written_u;
                     
-                    size_t next_chunk = (ctx->ring_period_pos != 0) ? (chunk_frames - ctx->ring_period_pos) : chunk_frames;
+                    size_t next_chunk = (ring_period_pos != 0) ? (chunk_frames - ring_period_pos) : chunk_frames;
 
                     /* Lock cruise delay ONLY once the DMA ring buffer is genuinely full and period-aligned */
-                    if (ctx->ring_period_pos == 0 &&
-                        ctx->continuous_frames >= total_buffer_frames &&
+                    if (ring_period_pos == 0 &&
+                        continuous_frames >= total_buffer_frames &&
                         (size_t)delay_frames >= (total_buffer_frames - (chunk_frames / 4))) {
-                        ctx->is_cruising = true;
-                        ctx->cruise_delay = delay_frames;
+                        is_cruising = true;
+                        cruise_delay = delay_frames;
                         wait_for_period = true;
                     } else if ((size_t)delay_frames + next_chunk > total_buffer_frames &&
-                               snd_pcm_state(ctx->pcm) == SND_PCM_STATE_RUNNING) {
+                               rt.pcm_state == SND_PCM_STATE_RUNNING) {
                         /* Buffer cannot safely fit the next aligned block;
                            sleep in poll() until avail_min frees up instead of risking a short write */
                         wait_for_period = true;
                     }
                 } else {
-                    delay_frames = ctx->cruise_delay;
+                    delay_frames = cruise_delay;
                 }
 
-                if (likely(shm != NULL)) {
-                    /* RT thread is the sole writer to shm->state; relaxed load avoids ldar fence */
-                    int current_st = atomic_load_explicit(&shm->state, memory_order_relaxed);
-                    if (unlikely(current_st == STATE_PAUSED)) {
-                        atomic_store_explicit(&shm->state, STATE_PLAYING, memory_order_release);
+                if (likely(local_shm != NULL)) {
+                    long max_ac = (long)play_frames;
+                    long acoustic = (long)(play_frames + eof_padded_silence) - delay_frames;
+                    if (acoustic > max_ac) {
+                        acoustic = max_ac;
+                    }
+                    if (acoustic < 0) {
+                        acoustic = 0;
                     }
 
-                    long max_ac = (long)ctx->play_frames;
-                    long acoustic = (long)(ctx->play_frames + eof_padded_silence) - delay_frames;
-                    if (acoustic > max_ac)
-                        acoustic = max_ac;
-                    if (acoustic < 0)
-                        acoustic = 0;
-
-                    atomic_store_explicit(&shm->current_frame, (uint64_t)acoustic, memory_order_relaxed);
+                    atomic_store_explicit(&local_shm->current_frame, (uint64_t)acoustic, memory_order_relaxed);
                 }
 
                 if (likely(wait_for_period && !(is_true_eof && eof_padded_silence >= 64))) {
-                    ctx->need_poll = true;
-                    if (wait_for_alsa_or_command(ctx, cmd_efd, timeout_ms))
+                    rt.need_poll = true;
+                    if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms))
                         break;
                 }
             } else {
-                ctx->need_poll = true;
-                if (wait_for_alsa_or_command(ctx, cmd_efd, timeout_ms))
+                rt.need_poll = true;
+                if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms))
                     break;
             }
             break;
         }
 
         case SM_FADING_OUT_INIT: {
-            ctx->need_poll = false;
-            fade_read_frames = ctx->play_frames;
+            rt.need_poll = false;
+            fade_read_frames = play_frames;
 
             /* If PCM has not started running yet (e.g. still PREPARED), hardware clock is stopped
                and no audio is leaving the speakers; skip fade-out to avoid waiting on static delay */
-            if (!ctx->pcm || snd_pcm_state(ctx->pcm) != SND_PCM_STATE_RUNNING) {
-                target_max_acoustic = (long)ctx->play_frames;
+            if (rt.rt_alsa_fd < 0 || rt.pcm_state != SND_PCM_STATE_RUNNING) {
+                target_max_acoustic = (long)play_frames;
                 sm_state = SM_FADING_OUT_FINALIZE;
                 break;
             }
 
-            long delay_frames = get_safe_alsa_delay(ctx, cmd);
+            long delay_frames = get_safe_alsa_delay(&rt);
             size_t prior_silence = (silence_frames_written > 0) ? silence_frames_written : eof_padded_silence;
-            size_t stream_pos = ctx->play_frames + prior_silence;
+            size_t stream_pos = play_frames + prior_silence;
 
             /* Seamless ring-buffer rewind to overwrite pending audio with a fade-out curve,
                preventing abrupt pops and minimizing latency. */
@@ -3310,12 +3785,12 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                 rewind_amount = (rewind_amount / page_step) * page_step;
                 
                 if (rewind_amount > 0) {
-                    snd_pcm_sframes_t actually_rewound = snd_pcm_rewind(ctx->pcm, rewind_amount);
+                    snd_pcm_sframes_t actually_rewound = alsa_direct_rewind(&rt, rewind_amount);
                     
                     if (actually_rewound > 0) {
                         size_t rewound_pos = (stream_pos >= (size_t)actually_rewound) ? 
                                              (stream_pos - (size_t)actually_rewound) : 0;
-                        if (rewound_pos < ctx->play_frames) {
+                        if (rewound_pos < play_frames) {
                             fade_read_frames = (rewound_pos / cache_frames) * cache_frames;
                         }
                     }
@@ -3326,20 +3801,15 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
             size_t silence_frames = optimal_fade_frames;
             size_t fade_bytes = fade_frames * frame_bytes;
             
-            uint64_t exact_total = shm ? atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire) : 0;
-            size_t live_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
-            if (exact_total > 0 && live_frames > (size_t)exact_total) {
-                live_frames = (size_t)exact_total;
-            }
-            if (data_frames > 0 && live_frames > data_frames) {
-                live_frames = data_frames;
-            }
+            size_t live_frames = refresh_stream_limits(ctx, local_shm, data_frames,
+                                                       &cached_exact_total, &cached_live_frames,
+                                                       &locked_limit);
             size_t avail_frames = (live_frames > fade_read_frames) ? (live_frames - fade_read_frames) : 0;
             size_t actual_fo = 0;
 
             /* Construct contiguous DMA buffer: Audio (fade-out) + Silence.
                Skip audio fade ONLY if we are already inside the EOF silence tail. */
-            bool in_silence_tail = (prior_silence > 0 && fade_read_frames >= ctx->play_frames);
+            bool in_silence_tail = (prior_silence > 0 && fade_read_frames >= play_frames);
             if (avail_frames > 0 && !in_silence_tail) {
                 actual_fo = (avail_frames < fade_frames) ? avail_frames : fade_frames;
                 actual_fo = (actual_fo / cache_frames) * cache_frames;
@@ -3349,14 +3819,13 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     apply_fade(rt_fade_buf, actual_fo, cmd, false);
                 }
                 if (actual_fo < fade_frames) {
-                    snd_pcm_format_set_silence(cmd->format,
-                        rt_fade_buf + (actual_fo * frame_bytes),
-                        (fade_frames - actual_fo) * cmd->channels);
+                    rt_set_silence(&rt, rt_fade_buf + (actual_fo * frame_bytes),
+                                   fade_frames - actual_fo, frame_bytes, cmd);
                 }
             } else {
-                snd_pcm_format_set_silence(cmd->format, rt_fade_buf, fade_frames * cmd->channels);
+                rt_set_silence(&rt, rt_fade_buf, fade_frames, frame_bytes, cmd);
             }
-            snd_pcm_format_set_silence(cmd->format, rt_fade_buf + fade_bytes, silence_frames * cmd->channels);
+            rt_set_silence(&rt, rt_fade_buf + fade_bytes, silence_frames, frame_bytes, cmd);
 
             pending_fade_frames = fade_frames + silence_frames;
             pending_fade_written = 0;
@@ -3376,7 +3845,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
             if (w == -EAGAIN) {
                 /* Yield core until DMA buffer frees up. Break switch to let the main loop 
                    re-evaluate SHM commands (e.g., CMD_RESUME intercept) while waiting. */
-                if (wait_for_alsa_or_command(ctx, cmd_efd, timeout_ms)) {
+                if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms)) {
                     break; 
                 }
             } else if (w < 0) {
@@ -3394,7 +3863,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
         }
 
         case SM_FADING_OUT_WAIT: {
-            long d_frames = get_safe_alsa_delay(ctx, cmd);
+            long d_frames = get_safe_alsa_delay(&rt);
             long guard_tail = (long)(pending_fade_frames - optimal_fade_frames);
             if (guard_tail < 0)
                 guard_tail = 0;
@@ -3405,7 +3874,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                before snd_pcm_drop(), cutting wait latency while preventing URB truncation clicks. */
             long stop_delay = resume_pending ? (guard_tail - (guard_tail / 4)) : (guard_tail / 2);
 
-            if (d_frames <= stop_delay || snd_pcm_state(ctx->pcm) != SND_PCM_STATE_RUNNING) {
+            if (d_frames <= stop_delay || rt.pcm_state != SND_PCM_STATE_RUNNING) {
                 sm_state = SM_FADING_OUT_FINALIZE;
                 break;
             }
@@ -3417,8 +3886,8 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
             if (acoustic < 0)
                 acoustic = 0;
 
-            if (shm)
-                atomic_store_explicit(&shm->current_frame, acoustic, memory_order_relaxed);
+            if (local_shm)
+                atomic_store_explicit(&local_shm->current_frame, acoustic, memory_order_relaxed);
 
             /* Adaptive sleep (2..15ms): avoids hammering ALSA kernel spinlocks during fade-out.
                cmd_efd still wakes poll() immediately if a command arrives. */
@@ -3441,19 +3910,20 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
 
         case SM_FADING_OUT_FINALIZE: {
             /* Instantly flush trailing silence to prevent ghost audio on next resume */
-            snd_pcm_drop(ctx->pcm);
+            alsa_direct_drop(&rt);
 
             long final_acoustic = target_max_acoustic;
-            if (final_acoustic < (long)fade_read_frames)
+            if (final_acoustic < (long)fade_read_frames) {
                 final_acoustic = (long)fade_read_frames;
+            }
 
-            ctx->play_frames = ((size_t)final_acoustic / cache_frames) * cache_frames;
-            ctx->ring_period_pos = 0;
-            ctx->need_poll = false;
+            play_frames = ((size_t)final_acoustic / cache_frames) * cache_frames;
+            ring_period_pos = 0;
+            rt.need_poll = false;
             eof_padded_silence = 0;
             silence_frames_needed = 0;
             silence_frames_written = 0;
-            update_sync_base(ctx, 0);
+            update_sync_base(ctx, play_frames, 0);
 
             if (fade_is_exit) {
                 atomic_store_explicit(&stop_flag, 1, memory_order_release);
@@ -3463,16 +3933,20 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                 resume_pending = false;
                 sm_state = SM_RESUMING;
             } else {
-                if (shm) {
-                    atomic_store_explicit(&shm->current_frame, final_acoustic, memory_order_release);
+                if (local_shm) {
+                    atomic_store_explicit(&local_shm->current_frame, final_acoustic, memory_order_release);
                     
                     /* Update state for JNI. Never mutate command channel internally. */
-                    atomic_store_explicit(&shm->state, STATE_PAUSED, memory_order_release);
+                    atomic_store_explicit(&local_shm->state, STATE_PAUSED, memory_order_release);
                 }
 
+                /* Invalidate alsa_fd before closing PCM so watcher thread never ioctls a closing FD */
+                rt.rt_alsa_fd = -1;
+                rt_pfds[0].fd = -1;
+                atomic_store_explicit(&ctx->alsa_fd, -1, memory_order_release);
+                rt.dma_area = NULL;
                 snd_pcm_close(ctx->pcm);
                 ctx->pcm = NULL;
-                ctx->alsa_fd = -1;
 
                 /* Revert real-time CPU isolation and USB hardware overrides to conserve battery */
                 release_usb_dac(cmd);
@@ -3486,9 +3960,9 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
         }
 
         case SM_SLEEPING: {
-            int current_cmd = shm ? atomic_load_explicit(&shm->command, memory_order_acquire) : CMD_NONE;
+            int current_cmd = local_shm ? atomic_load_explicit(&local_shm->command, memory_order_acquire) : CMD_NONE;
             
-            if (current_cmd != CMD_NONE && current_cmd != CMD_PAUSE)
+            if (current_cmd != CMD_NONE && current_cmd != CMD_PAUSE && current_cmd != CMD_UPDATE_TIME)
                 break;
             
             struct pollfd pfd = { .fd = cmd_efd, .events = POLLIN, .revents = 0 };
@@ -3557,75 +4031,107 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                         snd_pcm_sw_params_set_tstamp_mode(ctx->pcm, swp, SND_PCM_TSTAMP_NONE);
                         
                         if (snd_pcm_sw_params(ctx->pcm, swp) == 0 && snd_pcm_prepare(ctx->pcm) == 0) {
+                            if (snd_pcm_sw_params_get_boundary(swp, &rt.boundary) < 0 || rt.boundary == 0) {
+                                rt.boundary = actual_buf;
+                                while (rt.boundary <= (snd_pcm_uframes_t)(LONG_MAX / 2) - actual_buf) {
+                                    rt.boundary <<= 1;
+                                }
+                            }
+                            rt.buffer_frames = (uint32_t)actual_buf;
+                            rt.period_frames = (uint32_t)chunk_frames;
+                            rt.dma_area = NULL;
                             setup_ok = true;
+                            if (use_mmap) {
+                                const snd_pcm_channel_area_t *areas = NULL;
+                                snd_pcm_uframes_t mmap_offset = 0;
+                                snd_pcm_uframes_t mmap_frames = actual_buf;
+                                if (snd_pcm_mmap_begin(ctx->pcm, &areas, &mmap_offset, &mmap_frames) == 0 &&
+                                    areas && areas[0].addr) {
+                                    rt.dma_area = (uint8_t *)areas[0].addr + (areas[0].first >> 3);
+                                } else {
+                                    setup_ok = false;
+                                }
+                            }
+                            rt.appl_ptr = 0;
+                            rt.ring_buf_pos = 0;
+                            rt.known_avail = (size_t)actual_buf;
+                            rt.pcm_state = (uint8_t)SND_PCM_STATE_PREPARED;
                         }
                     }
 
                     if (setup_ok) {
-                        ctx->alsa_fd = -1;
+                        int new_fd = -1;
                         int count = snd_pcm_poll_descriptors_count(ctx->pcm);
                         if (count >= 1 && count < 16) {
                             struct pollfd pfds[16];
                             if (snd_pcm_poll_descriptors(ctx->pcm, pfds, count) == count) {
-                                ctx->alsa_fd = pfds[0].fd;
+                                new_fd = pfds[0].fd;
                             }
+                        }
+                        rt.rt_alsa_fd = new_fd;
+                        rt_pfds[0].fd = new_fd;
+                        atomic_store_explicit(&ctx->alsa_fd, new_fd, memory_order_release);
+                        if (new_fd < 0) {
+                            setup_ok = false;
                         }
                     }
                 } else {
-                    /* Fast resume path (PCM remained open): reset ring buffer pointers to 0 */
-                    if (snd_pcm_prepare(ctx->pcm) == 0) {
+                    /* Fast resume path (PCM remained open): reset ring buffer pointers to 0 directly via kernel */
+                    if (alsa_direct_prepare(&rt) == 0) {
                         setup_ok = true;
                     }
                 }
 
                 if (!setup_ok) {
+                    rt.rt_alsa_fd = -1;
+                    rt_pfds[0].fd = -1;
+                    atomic_store_explicit(&ctx->alsa_fd, -1, memory_order_release);
+                    rt.dma_area = NULL;
                     snd_pcm_close(ctx->pcm);
                     ctx->pcm = NULL;
-                    ctx->alsa_fd = -1;
                     
                     struct pollfd pfd = { .fd = cmd_efd, .events = POLLIN, .revents = 0 };
                     poll(&pfd, 1, 10);
                     break;
                 }
 
-                ctx->is_cruising = false;
-                ctx->need_poll = false;
-                ctx->continuous_frames = 0;
-                ctx->cruise_delay = 0;
-                ctx->ring_period_pos = 0;
+                is_cruising = false;
+                rt.need_poll = false;
+                continuous_frames = 0;
+                cruise_delay = 0;
+                ring_period_pos = 0;
 
                 /* Warm up newly opened USB DAC with 80ms silence so PLL locks before fade-in */
                 if (cold_reopen) {
                     snd_pcm_sframes_t w_warm = ALSA_WRITE(ctx->pcm, silence_buf, wakeup_frames);
                     if (w_warm > 0) {
-                        ctx->continuous_frames += (size_t)w_warm;
-                        ctx->ring_period_pos = ring_pos_add_fast(ctx->ring_period_pos, (size_t)w_warm, chunk_frames);
+                        continuous_frames += (size_t)w_warm;
+                        ring_period_pos = ring_pos_add_fast(ring_period_pos, (size_t)w_warm, chunk_frames);
                     }
                 }
 
                 /* Soft start sequence: copy only optimal_fade_frames (~8 KB) to preserve L1/L2 cache.
                    SM_PLAYING will immediately fill the rest of the buffer via zero-copy mmap from current appl_ptr. */
-                uint64_t exact_total = shm ? atomic_load_explicit(&shm->exact_total_frames, memory_order_acquire) : 0;
-                size_t limit_frames = atomic_load_explicit(&ctx->live_file_frames, memory_order_acquire);
-                if (data_frames > 0 && limit_frames > data_frames)
-                    limit_frames = data_frames;
-                if (exact_total > 0 && limit_frames > (size_t)exact_total)
-                    limit_frames = (size_t)exact_total;
+                size_t limit_frames = refresh_stream_limits(ctx, local_shm, data_frames,
+                                                            &cached_exact_total, &cached_live_frames,
+                                                            &locked_limit);
 
-                size_t avail_frames = (limit_frames > ctx->play_frames) ? (limit_frames - ctx->play_frames) : 0;
+                size_t avail_frames = (limit_frames > play_frames) ? (limit_frames - play_frames) : 0;
                 
-                size_t free_buf_frames = (total_buffer_frames > ctx->continuous_frames) ?
-                                         (total_buffer_frames - ctx->continuous_frames) : 0;
+                size_t free_buf_frames = (total_buffer_frames > continuous_frames) ?
+                                         (total_buffer_frames - continuous_frames) : 0;
                 size_t fi_frames = optimal_fade_frames;
-                if (fi_frames > avail_frames)
+                if (fi_frames > avail_frames) {
                     fi_frames = avail_frames;
-                if (fi_frames > free_buf_frames)
+                }
+                if (fi_frames > free_buf_frames) {
                     fi_frames = free_buf_frames;
+                }
                 fi_frames = (fi_frames / cache_frames) * cache_frames;
 
                 size_t actual_resumed = 0;
                 if (fi_frames > 0) {
-                    uint8_t *data_ptr = data_start + (ctx->play_frames * frame_bytes);
+                    uint8_t *data_ptr = data_start + (play_frames * frame_bytes);
                     memcpy(rt_fade_buf, data_ptr, fi_frames * frame_bytes);
                     apply_fade(rt_fade_buf, fi_frames, cmd, true);
 
@@ -3635,14 +4141,14 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     }
                 }
 
-                ctx->play_frames += actual_resumed;
-                ctx->continuous_frames += actual_resumed;
-                ctx->ring_period_pos = ring_pos_add_safe(ctx->ring_period_pos, actual_resumed, chunk_frames);
+                play_frames += actual_resumed;
+                continuous_frames += actual_resumed;
+                ring_period_pos = ring_pos_add_safe(ring_period_pos, actual_resumed, chunk_frames);
                 eof_padded_silence = 0;
-                update_sync_base(ctx, 0);
+                update_sync_base(ctx, play_frames, 0);
                 
-                if (shm)
-                    atomic_store_explicit(&shm->state, STATE_PLAYING, memory_order_release);
+                if (local_shm)
+                    atomic_store_explicit(&local_shm->state, STATE_PLAYING, memory_order_release);
                 
                 sm_state = SM_PLAYING;
             } else {
@@ -3664,11 +4170,11 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
         case SM_DRAINING: {
             if (silence_frames_written >= silence_frames_needed) {
                 /* Force start if a short file (< buffer_size) reached draining while PREPARED */
-                if (snd_pcm_state(ctx->pcm) == SND_PCM_STATE_PREPARED) {
-                    snd_pcm_start(ctx->pcm);
+                if (rt.pcm_state == SND_PCM_STATE_PREPARED) {
+                    alsa_direct_start(&rt);
                 }
 
-                long hw_delay = get_safe_alsa_delay(ctx, cmd);
+                long hw_delay = get_safe_alsa_delay(&rt);
 
                 /* Phase 2: Wait for DMA flush. hw_delay <= silence - 64 means real audio reached speakers */
                 long target_delay = (long)silence_frames_written - 64;
@@ -3683,13 +4189,15 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
 
                 /* Update UI timer BEFORE sleeping using already-fetched hw_delay 
                    (eliminates the duplicate back-to-back ioctl call at update_drain_timer) */
-                if (shm) {
-                    long acoustic = (long)(ctx->play_frames + silence_frames_written) - hw_delay;
-                    if (acoustic > (long)ctx->play_frames)
-                        acoustic = (long)ctx->play_frames;
-                    if (acoustic < 0)
+                if (local_shm) {
+                    long acoustic = (long)(play_frames + silence_frames_written) - hw_delay;
+                    if (acoustic > (long)play_frames) {
+                        acoustic = (long)play_frames;
+                    }
+                    if (acoustic < 0) {
                         acoustic = 0;
-                    atomic_store_explicit(&shm->current_frame, acoustic, memory_order_relaxed);
+                    }
+                    atomic_store_explicit(&local_shm->current_frame, acoustic, memory_order_relaxed);
                 }
 
                 /* Adaptive sleep (2..20ms): keeps isolated RT core and USB IRQ spinlocks quiet
@@ -3711,15 +4219,15 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
             }
 
             /* Wait for POLLOUT if the final SM_PLAYING chunk filled the buffer with < 64 pad frames */
-            if (unlikely(ctx->need_poll)) {
-                if (wait_for_alsa_or_command(ctx, cmd_efd, timeout_ms))
+            if (unlikely(rt.need_poll)) {
+                if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms))
                     break;
-                if (ctx->need_poll)
+                if (rt.need_poll)
                     goto update_drain_timer;
             }
             
             /* Phase 1: Write pre-allocated silence only when eof_padded_silence was < 64 frames */
-            size_t chunk_f = cmd->period_size;
+            size_t chunk_f = chunk_frames;
             if (silence_frames_written + chunk_f > silence_frames_needed) {
                 chunk_f = silence_frames_needed - silence_frames_written;
             }
@@ -3728,15 +4236,15 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                 snd_pcm_sframes_t w = ALSA_WRITE(ctx->pcm, silence_buf, chunk_f);
 
                 if (w < 0) {
-                    int cmd_now = shm ? atomic_load_explicit(&shm->command, memory_order_acquire) : CMD_NONE;
+                    int cmd_now = local_shm ? atomic_load_explicit(&local_shm->command, memory_order_acquire) : CMD_NONE;
                     if (cmd_now == CMD_PAUSE || cmd_now == CMD_SEEK || cmd_now == CMD_EXIT ||
                         atomic_load_explicit(&signal_event, memory_order_acquire)) {
                         break; 
                     }
                     
                     if (w == -EAGAIN) { 
-                        ctx->need_poll = true;
-                        if (wait_for_alsa_or_command(ctx, cmd_efd, timeout_ms))
+                        rt.need_poll = true;
+                        if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms))
                             break;
                         goto update_drain_timer; 
                     }
@@ -3754,10 +4262,10 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     break;
                 } else if (w > 0) {
                     silence_frames_written += (size_t)w;
-                    ctx->ring_period_pos = ring_pos_add_fast(ctx->ring_period_pos, (size_t)w, chunk_frames);
-                    update_sync_base(ctx, silence_frames_written);
+                    ring_period_pos = ring_pos_add_fast(ring_period_pos, (size_t)w, chunk_frames);
+                    update_sync_base(ctx, play_frames, silence_frames_written);
                     if (silence_frames_written < silence_frames_needed) {
-                        ctx->need_poll = true;
+                        rt.need_poll = true;
                     } else {
                         /* Phase 2 immediately queries get_safe_alsa_delay() on the next iteration */
                         break;
@@ -3767,20 +4275,22 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
             
         update_drain_timer:
             /* Smooth lock-free UI timer updates during drain */
-            if (shm) {
-                long delay_sync = get_safe_alsa_delay(ctx, cmd);
+            if (local_shm) {
+                long delay_sync = get_safe_alsa_delay(&rt);
                 
                 /* Calculate frames physically emitted from the speakers */
-                long frames_emitted = (long)(ctx->play_frames + silence_frames_written) - delay_sync;
+                long frames_emitted = (long)(play_frames + silence_frames_written) - delay_sync;
                 
                 /* Restrict timer to valid acoustic frames, stripping trailing silence */
                 long acoustic = frames_emitted;
-                if (acoustic > (long)ctx->play_frames)
-                    acoustic = (long)ctx->play_frames;
-                if (acoustic < 0)
+                if (acoustic > (long)play_frames) {
+                    acoustic = (long)play_frames;
+                }
+                if (acoustic < 0) {
                     acoustic = 0;
+                }
                 
-                atomic_store_explicit(&shm->current_frame, acoustic, memory_order_relaxed);
+                atomic_store_explicit(&local_shm->current_frame, acoustic, memory_order_relaxed);
             }
             break;
         }
@@ -3797,17 +4307,17 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
         free(rt_fade_buf);
     }
 
-    printf("\nPlayed %zu frames. Remains %zu frames.\n", ctx->play_frames, data_frames > ctx->play_frames ? data_frames - ctx->play_frames : 0);
+    printf("\nPlayed %zu frames. Remains %zu frames.\n", play_frames, data_frames > play_frames ? data_frames - play_frames : 0);
     
-    if (ctx->pcm) {
-        snd_pcm_drop(ctx->pcm);
+    if (rt.rt_alsa_fd >= 0) {
+        alsa_direct_drop(&rt);
     }
     
-    if (shm) {
+    if (local_shm) {
         if (is_hw_error) {
-            atomic_store_explicit(&shm->state, STATE_ERROR, memory_order_release);
+            atomic_store_explicit(&local_shm->state, STATE_ERROR, memory_order_release);
         } else {
-            atomic_store_explicit(&shm->state, STATE_COMPLETED, memory_order_release);
+            atomic_store_explicit(&local_shm->state, STATE_COMPLETED, memory_order_release);
         }
     }
 
@@ -3820,9 +4330,9 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
         g_shm_fd = -1;
     }
     
-    if (shm) {
-        atomic_store_explicit(&shm->command, CMD_EXIT, memory_order_release);
-        sys_futex((int *)&shm->command, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+    if (local_shm) {
+        atomic_store_explicit(&local_shm->command, CMD_EXIT, memory_order_release);
+        sys_futex((int *)&local_shm->command, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
     }
     
     if (watcher_started)
