@@ -971,7 +971,7 @@ static void
 precalc_system_state(int target_core, int freq_percent)
 {
     g_state_count = 0;
-    char path[128], buf[64], cluster_cpus[64] = { 0 };
+    char path[128], cluster_cpus[64] = { 0 };
     
     long num_cpus = sysconf(_SC_NPROCESSORS_CONF);
     if (num_cpus < 1)
@@ -2183,7 +2183,6 @@ evict_thread_from_rt_core(int rt_core, bool is_warmer, atomic_int *evicted_ack)
 
 /* Arguments for the watcher thread */
 struct watcher_args {
-    pthread_t main_tid;
     struct ctx *ctx;
     const struct cmd *cmd;
     int cmd_efd;
@@ -3160,8 +3159,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
     atomic_init(&ctx->sync_base_frames, play_frames);
     atomic_init(&ctx->sync_audio_frames, play_frames);
     atomic_init(&ctx->bg_evicted_count, 0);
-    pthread_t main_tid = pthread_self(); 
-    struct watcher_args wargs = { .main_tid = main_tid, .ctx = ctx, .cmd = cmd, .cmd_efd = cmd_efd };
+    struct watcher_args wargs = { .ctx = ctx, .cmd = cmd, .cmd_efd = cmd_efd };
     
     int expected_bg_threads = 0;
     pthread_t watcher_tid, warmer_tid;
@@ -3562,14 +3560,10 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     (data_frames > 0 && play_frames >= data_frames)) {
                     
                     /* Transition to DRAINING:
-                       If eof_padded_silence >= 64, the ring buffer already holds a safe trailing
-                       silence cushion after the final audio sample, so zero extra writes are needed. */
+                       Require 2x safety_margin of trailing silence (1x to flush the final audio URB
+                       and DAC filter, plus 1x kept in-flight in target_delay to prevent URB starvation). */
                     silence_frames_written = eof_padded_silence;
-                    if (silence_frames_written >= 64) {
-                        silence_frames_needed = silence_frames_written;
-                    } else {
-                        silence_frames_needed = silence_frames_written + chunk_frames;
-                    }
+                    silence_frames_needed = safety_margin << 1;
 
                     if (local_shm)
                         atomic_store_explicit(&local_shm->state, STATE_DRAINING, memory_order_release);
@@ -3749,7 +3743,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     atomic_store_explicit(&local_shm->current_frame, (uint64_t)acoustic, memory_order_relaxed);
                 }
 
-                if (likely(wait_for_period && !(is_true_eof && eof_padded_silence >= 64))) {
+                if (likely(wait_for_period && !(is_true_eof && eof_padded_silence >= (safety_margin << 1)))) {
                     rt.need_poll = true;
                     if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms))
                         break;
@@ -4176,12 +4170,13 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
 
                 long hw_delay = get_safe_alsa_delay(&rt);
 
-                /* Phase 2: Wait for DMA flush. hw_delay <= silence - 64 means real audio reached speakers */
-                long target_delay = (long)silence_frames_written - 64;
+                /* Phase 2: Wait until safety_margin of silence has flushed the final audio URB,
+                   while keeping >= safety_margin in flight (target_delay) to prevent XRUN before drop. */
+                long target_delay = (long)silence_frames_written - (long)safety_margin;
                 if (target_delay < 0)
                     target_delay = 0;
 
-                /* 64-frame silence margin to prevent stop_threshold XRUN before drop */
+                /* Stop once safety_margin of trailing silence has been emitted after real audio */
                 if (hw_delay <= target_delay || hw_delay <= 0) {
                     track_completed = true;
                     break;
@@ -4218,7 +4213,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                 break;
             }
 
-            /* Wait for POLLOUT if the final SM_PLAYING chunk filled the buffer with < 64 pad frames */
+            /* Wait for POLLOUT if the final SM_PLAYING chunk filled the buffer with < 2x safety_margin pad frames */
             if (unlikely(rt.need_poll)) {
                 if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms))
                     break;
@@ -4226,50 +4221,44 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     goto update_drain_timer;
             }
             
-            /* Phase 1: Write pre-allocated silence only when eof_padded_silence was < 64 frames */
-            size_t chunk_f = chunk_frames;
-            if (silence_frames_written + chunk_f > silence_frames_needed) {
-                chunk_f = silence_frames_needed - silence_frames_written;
-            }
-            
-            if (chunk_f > 0) {
-                snd_pcm_sframes_t w = ALSA_WRITE(ctx->pcm, silence_buf, chunk_f);
+            /* Phase 1: Write period-aligned silence chunks until >= 2x safety_margin frames are queued */
+            size_t chunk_f = unlikely(ring_period_pos != 0) ? (chunk_frames - ring_period_pos) : chunk_frames;
+            snd_pcm_sframes_t w = ALSA_WRITE(ctx->pcm, silence_buf, chunk_f);
 
-                if (w < 0) {
-                    int cmd_now = local_shm ? atomic_load_explicit(&local_shm->command, memory_order_acquire) : CMD_NONE;
-                    if (cmd_now == CMD_PAUSE || cmd_now == CMD_SEEK || cmd_now == CMD_EXIT ||
-                        atomic_load_explicit(&signal_event, memory_order_acquire)) {
-                        break; 
-                    }
-                    
-                    if (w == -EAGAIN) { 
-                        rt.need_poll = true;
-                        if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms))
-                            break;
-                        goto update_drain_timer; 
-                    }
-
-                    if (w == -EINTR)
+            if (w < 0) {
+                int cmd_now = local_shm ? atomic_load_explicit(&local_shm->command, memory_order_acquire) : CMD_NONE;
+                if (cmd_now == CMD_PAUSE || cmd_now == CMD_SEEK || cmd_now == CMD_EXIT ||
+                    atomic_load_explicit(&signal_event, memory_order_acquire)) {
+                    break; 
+                }
+                
+                if (w == -EAGAIN) { 
+                    rt.need_poll = true;
+                    if (wait_for_alsa_or_command(&rt, ctx, rt_pfds, cmd_efd, timeout_ms))
                         break;
-                    
-                    if (w == -EPIPE || w == -ESTRPIPE) { 
-                        track_completed = true; 
-                        break; 
-                    }
-                    
-                    is_hw_error = true;
-                    atomic_store_explicit(&stop_flag, 1, memory_order_release);
+                    goto update_drain_timer; 
+                }
+
+                if (w == -EINTR)
                     break;
-                } else if (w > 0) {
-                    silence_frames_written += (size_t)w;
-                    ring_period_pos = ring_pos_add_fast(ring_period_pos, (size_t)w, chunk_frames);
-                    update_sync_base(ctx, play_frames, silence_frames_written);
-                    if (silence_frames_written < silence_frames_needed) {
-                        rt.need_poll = true;
-                    } else {
-                        /* Phase 2 immediately queries get_safe_alsa_delay() on the next iteration */
-                        break;
-                    }
+                
+                if (w == -EPIPE || w == -ESTRPIPE) { 
+                    track_completed = true; 
+                    break; 
+                }
+                
+                is_hw_error = true;
+                atomic_store_explicit(&stop_flag, 1, memory_order_release);
+                break;
+            } else if (w > 0) {
+                silence_frames_written += (size_t)w;
+                ring_period_pos = ring_pos_add_fast(ring_period_pos, (size_t)w, chunk_frames);
+                update_sync_base(ctx, play_frames, silence_frames_written);
+                if (silence_frames_written < silence_frames_needed) {
+                    rt.need_poll = true;
+                } else {
+                    /* Phase 2 immediately queries get_safe_alsa_delay() on the next iteration */
+                    break;
                 }
             }
             
@@ -4580,13 +4569,8 @@ main(int argc, char **argv)
         /* Supervisor process name */
         const char *DaemonName = "tplayd";
 
-        /* Change name for top/htop by modifying argv[0] */
+        /* Change name for top/htop by modifying argv[0] (strncpy zero-pads remainder) */
         strncpy(argv[0], DaemonName, strlen(argv[0]));
-        
-        /* Clear remainder of the old name */
-        for (size_t i = strlen(DaemonName); i < strlen(argv[0]); i++) {
-            argv[0][i] = '\0';
-        }
         
         /* Change thread name for ps */
         prctl(PR_SET_NAME, DaemonName, 0, 0, 0);
