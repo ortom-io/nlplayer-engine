@@ -3505,6 +3505,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
     /* Lock-free FSM trackers for non-blocking state transitions */
     bool fade_is_exit = false;
     bool resume_pending = false;
+    int resume_retries = 0;
     size_t pending_fade_frames = 0;
     size_t pending_fade_written = 0;
     long target_total_written = 0;
@@ -3627,6 +3628,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                         sm_state = SM_FADING_OUT_INIT;
                         continue;
                     } else if (sm_state == SM_RESUMING) {
+                        resume_retries = 0;
                         if (rt.rt_alsa_fd >= 0) {
                             fade_is_exit = false;
                             sm_state = SM_FADING_OUT_INIT;
@@ -3647,6 +3649,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     atomic_compare_exchange_strong_explicit(&local_shm->command, &expected_cmd, CMD_NONE, memory_order_release, memory_order_relaxed);
                     
                     if (sm_state == SM_SLEEPING) {
+                        resume_retries = 0;
                         sm_state = SM_RESUMING;
                     } else if (sm_state >= SM_FADING_OUT_INIT && sm_state <= SM_FADING_OUT_FINALIZE) {
                         /* Let the 50ms fade-out finish draining cleanly without corrupting ring buffer alignment,
@@ -4229,6 +4232,7 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                 /* Fast resume: CMD_RESUME arrived during fade-out.
                    Keep PCM open and CPU bunker active, transition straight to SM_RESUMING. */
                 resume_pending = false;
+                resume_retries = 0;
                 sm_state = SM_RESUMING;
             } else {
                 if (local_shm) {
@@ -4275,25 +4279,21 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
         case SM_RESUMING: {
             /* State: SM_RESUMING (Wake up and fade-in) */
             bool cold_reopen = false;
+            bool setup_ok = false;
+            int open_err = 0;
+
             if (!ctx->pcm) {
                 cold_reopen = true;
                 acquire_usb_dac(cmd);
-                if (!sys_isolated) {
-                    fast_apply_system_state();
-                    optimize_process(cmd->cpu_core);
-                    sys_isolated = true;
-                }
 
                 char dev_name[64];
                 snprintf(dev_name, sizeof(dev_name), "hw:%u,%u", cmd->card, cmd->device);
                 
                 int open_mode = SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT | SND_PCM_NO_SOFTVOL | SND_PCM_NONBLOCK;
-                snd_pcm_open(&ctx->pcm, dev_name, SND_PCM_STREAM_PLAYBACK, open_mode);
+                open_err = snd_pcm_open(&ctx->pcm, dev_name, SND_PCM_STREAM_PLAYBACK, open_mode);
             }
 
             if (ctx->pcm) {
-                bool setup_ok = false;
-
                 if (cold_reopen) {
                     snd_pcm_hw_params_any(ctx->pcm, hwp);
                     
@@ -4375,8 +4375,11 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     }
                 } else {
                     /* Fast resume path (PCM remained open): reset ring buffer pointers to 0 directly via kernel */
-                    if (alsa_direct_prepare(&rt) == 0) {
+                    int prep_err = alsa_direct_prepare(&rt);
+                    if (prep_err == 0) {
                         setup_ok = true;
+                    } else if (prep_err == -ENODEV) {
+                        open_err = prep_err;
                     }
                 }
 
@@ -4387,10 +4390,15 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                     rt.dma_area = NULL;
                     snd_pcm_close(ctx->pcm);
                     ctx->pcm = NULL;
-                    
-                    struct pollfd pfd = { .fd = cmd_efd, .events = POLLIN, .revents = 0 };
-                    poll(&pfd, 1, 10);
-                    break;
+                }
+            }
+
+            if (setup_ok) {
+                resume_retries = 0;
+                if (!sys_isolated) {
+                    fast_apply_system_state();
+                    optimize_process(cmd->cpu_core);
+                    sys_isolated = true;
                 }
 
                 is_cruising = false;
@@ -4450,16 +4458,25 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                 
                 sm_state = SM_PLAYING;
             } else {
+                if ((open_err < 0 && open_err != -EBUSY && open_err != -EAGAIN && open_err != -EINTR) ||
+                    ++resume_retries > 50) {
+                    is_hw_error = true;
+                    atomic_store_explicit(&stop_flag, 1, memory_order_release);
+                    break;
+                }
+
+                if (sys_isolated) {
+                    fast_revert_system_state(true, false);
+                    reset_process_priority();
+                    sys_isolated = false;
+                }
+
                 /* Hardware initialization failed. Sleep briefly and retry */
                 struct pollfd pfd = { .fd = cmd_efd, .events = POLLIN, .revents = 0 };
                 poll(&pfd, 1, 10);
                 
                 if (pfd.revents & POLLIN) {
                     ack_cmd_efd(ctx, cmd_efd);
-                }
-                
-                if (atomic_load_explicit(&stop_flag, memory_order_acquire)) {
-                    break;
                 }
             }
             break;
