@@ -65,6 +65,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 
 #include <alsa/asoundlib.h>
@@ -517,99 +518,402 @@ trim_newline(char *str)
 /* =========================================================================
    USB DAC EXCLUSIVE ACCESS (UNBIND -> REMOVE -> BIND)
    ========================================================================= */
-static void
-acquire_usb_dac(struct cmd *cmd)
-{
-    if (!cmd->use_unbind)
-        return;
-
-    char temp_path[PATH_MAX];
+struct usb_dac_shm {
+    atomic_bool dac_claimed;
+    unsigned int card;
+    unsigned int device;
+    char usb_id[64];
     char usb_root_path[PATH_MAX];
-    char unbind_path[] = "/sys/bus/usb/drivers/snd-usb-audio/unbind";
-    char bind_path[]   = "/sys/bus/usb/drivers/snd-usb-audio/bind";
+    char usb_uevent_path[PATH_MAX];
+    char usb_devnode_path[PATH_MAX];
+    char uaudio_qmi_dev[128];
+    int iface_count;
+    char ifaces[16][64];
+};
 
-    /* Find USB device root */
-    snprintf(temp_path, sizeof(temp_path), "/sys/class/sound/card%u/device/..", cmd->card);
-    if (!realpath(temp_path, usb_root_path))
-        return;
+static struct usb_dac_shm g_dac_shm_fallback;
+static struct usb_dac_shm *g_dac_shm = &g_dac_shm_fallback;
 
-    /* Extract host ID */
-    char *usb_id = strrchr(usb_root_path, '/');
-    if (!usb_id)
-        return;
-    usb_id++;
-
-    /* Check for usbfs lock to prevent kernel panic */
-    DIR *d_usbfs = opendir("/sys/bus/usb/drivers/usbfs");
-    if (d_usbfs) {
-        struct dirent *ent;
-        size_t id_len = strlen(usb_id);
-        bool used_by_usbfs = false;
-        
-        while ((ent = readdir(d_usbfs))) {
-            if (strncmp(ent->d_name, usb_id, id_len) == 0 && ent->d_name[id_len] == ':') {
-                used_by_usbfs = true;
-                break;
-            }
+static ATTR_COLD int
+cmp_usb_iface_names(const void *a, const void *b)
+{
+    const char *sa = (const char *)a;
+    const char *sb = (const char *)b;
+    const char *ca = strrchr(sa, ':');
+    const char *cb = strrchr(sb, ':');
+    if (ca && cb) {
+        unsigned int cfg_a = 0, if_a = 0;
+        unsigned int cfg_b = 0, if_b = 0;
+        if (sscanf(ca + 1, "%u.%u", &cfg_a, &if_a) == 2 &&
+            sscanf(cb + 1, "%u.%u", &cfg_b, &if_b) == 2) {
+            if (cfg_a != cfg_b)
+                return (cfg_a < cfg_b) ? -1 : 1;
+            if (if_a != if_b)
+                return (if_a < if_b) ? -1 : 1;
         }
-        closedir(d_usbfs);
-        
-        /* Abort if device is claimed by libusb/usbfs user-space driver */
-        if (used_by_usbfs)
-            return;
     }
-
-    /* Save uevent path for restoration */
-    snprintf(cmd->usb_uevent_path, sizeof(cmd->usb_uevent_path), "%s/uevent", usb_root_path);
-
-    /* Find audio interfaces */
-    char ifaces[8][32];
-    int iface_count = 0;
-    size_t id_len = strlen(usb_id);
-
-    DIR *d = opendir("/sys/bus/usb/drivers/snd-usb-audio");
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) && iface_count < 8) {
-            if (strncmp(ent->d_name, usb_id, id_len) == 0 && ent->d_name[id_len] == ':') {
-                strncpy(ifaces[iface_count], ent->d_name, sizeof(ifaces[0]) - 1);
-                ifaces[iface_count][sizeof(ifaces[0]) - 1] = '\0';
-                iface_count++;
-            }
-        }
-        closedir(d);
-    }
-
-    if (iface_count == 0)
-        return;
-
-    /* Unbind driver immediately */
-    for (int i = 0; i < iface_count; i++) {
-        sys_write_opt(unbind_path, ifaces[i]);
-    }
-
-    /* Send remove uevent */
-    sys_write_opt(cmd->usb_uevent_path, "remove");
-
-    /* Rebind driver */
-    for (int i = 0; i < iface_count; i++) {
-        sys_write_opt(bind_path, ifaces[i]);
-    }
-
-    cmd->dac_claimed = true;
+    return strcmp(sa, sb);
 }
 
-static void
-release_usb_dac(struct cmd *cmd)
+static ATTR_COLD bool
+is_claimed_by_usbfs(const char *usb_id)
 {
-    if (!cmd->use_unbind)
+    if (!usb_id || !*usb_id)
+        return false;
+
+    DIR *d_usbfs = opendir("/sys/bus/usb/drivers/usbfs");
+    if (!d_usbfs)
+        return false;
+
+    struct dirent *ent;
+    size_t id_len = strlen(usb_id);
+    bool used_by_usbfs = false;
+
+    while ((ent = readdir(d_usbfs)) != NULL) {
+        if (strncmp(ent->d_name, usb_id, id_len) == 0 && ent->d_name[id_len] == ':') {
+            used_by_usbfs = true;
+            break;
+        }
+    }
+    closedir(d_usbfs);
+    return used_by_usbfs;
+}
+
+static ATTR_COLD bool
+parse_usb_uevent(const char *uevent_path, char *devnode_out, size_t devnode_size)
+{
+    if (devnode_out && devnode_size > 0)
+        devnode_out[0] = '\0';
+
+    if (!uevent_path || !*uevent_path)
+        return false;
+
+    char buf[1024];
+    int fd = open(uevent_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return false;
+    buf[n] = '\0';
+
+    bool is_usb_device = false;
+    unsigned int busnum = 0;
+    unsigned int devnum = 0;
+    bool has_bus = false;
+    bool has_dev = false;
+    char devname[256] = {0};
+
+    char *line = buf;
+    while (line && *line) {
+        char *next = strchr(line, '\n');
+        if (next)
+            *next++ = '\0';
+        trim_newline(line);
+
+        if (strcmp(line, "DEVTYPE=usb_device") == 0) {
+            is_usb_device = true;
+        } else if (strncmp(line, "DEVNAME=", 8) == 0 && line[8] != '\0') {
+            snprintf(devname, sizeof(devname), "%s", line + 8);
+        } else if (strncmp(line, "BUSNUM=", 7) == 0) {
+            if (sscanf(line + 7, "%u", &busnum) == 1)
+                has_bus = true;
+        } else if (strncmp(line, "DEVNUM=", 7) == 0) {
+            if (sscanf(line + 7, "%u", &devnum) == 1)
+                has_dev = true;
+        }
+        line = next;
+    }
+
+    if (!is_usb_device)
+        return false;
+
+    if (devnode_out && devnode_size > 0) {
+        if (devname[0] != '\0') {
+            if (devname[0] == '/')
+                snprintf(devnode_out, devnode_size, "%s", devname);
+            else
+                snprintf(devnode_out, devnode_size, "/dev/%s", devname);
+        } else if (has_bus && has_dev) {
+            snprintf(devnode_out, devnode_size, "/dev/bus/usb/%03u/%03u", busnum, devnum);
+        }
+    }
+
+    return true;
+}
+
+static ATTR_COLD void
+acquire_usb_dac(struct cmd *cmd)
+{
+    if (!cmd || !cmd->use_unbind)
         return;
 
-    /* Restore uevent state */
-    if (cmd->dac_claimed && cmd->usb_uevent_path[0] != '\0') {
-        sys_write_opt(cmd->usb_uevent_path, "add");
-        cmd->dac_claimed = false;
+    struct usb_dac_shm *dac = (g_dac_shm && g_dac_shm != MAP_FAILED) ? g_dac_shm : &g_dac_shm_fallback;
+    if (atomic_load_explicit(&dac->dac_claimed, memory_order_acquire)) {
+        cmd->dac_claimed = true;
+        return;
     }
+
+    /* Step 1: Resolve USB device root, verify usbfs safety, and enumerate interfaces */
+    char temp_path[PATH_MAX];
+    char resolved_root[PATH_MAX];
+    snprintf(temp_path, sizeof(temp_path), "/sys/class/sound/card%u/device/..", cmd->card);
+
+    if (realpath(temp_path, resolved_root) != NULL) {
+        const char *slash = strrchr(resolved_root, '/');
+        if (!slash || slash[1] == '\0')
+            return;
+        const char *usb_id = slash + 1;
+
+        /* Abort if device is claimed by libusb/usbfs user-space driver */
+        if (is_claimed_by_usbfs(usb_id))
+            return;
+
+        char uevent_path[PATH_MAX];
+        int uev_len = snprintf(uevent_path, sizeof(uevent_path), "%s/uevent", resolved_root);
+        if (uev_len < 0 || (size_t)uev_len >= sizeof(uevent_path))
+            return;
+
+        char devnode_path[PATH_MAX];
+        if (!parse_usb_uevent(uevent_path, devnode_path, sizeof(devnode_path)))
+            return;
+
+        char scanned_ifaces[16][64];
+        int scanned_count = 0;
+        size_t id_len = strlen(usb_id);
+
+        DIR *d = opendir("/sys/bus/usb/drivers/snd-usb-audio");
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL && scanned_count < 16) {
+                if (strncmp(ent->d_name, usb_id, id_len) == 0 && ent->d_name[id_len] == ':') {
+                    snprintf(scanned_ifaces[scanned_count], sizeof(scanned_ifaces[0]), "%s", ent->d_name);
+                    scanned_count++;
+                }
+            }
+            closedir(d);
+        }
+
+        if (scanned_count > 0) {
+            /* Sort ascending so :1.0 (AudioControl) is always unbound first and bound first */
+            qsort(scanned_ifaces, (size_t)scanned_count, sizeof(scanned_ifaces[0]), cmp_usb_iface_names);
+
+            dac->card = cmd->card;
+            dac->device = cmd->device;
+            snprintf(dac->usb_id, sizeof(dac->usb_id), "%s", usb_id);
+            snprintf(dac->usb_root_path, sizeof(dac->usb_root_path), "%s", resolved_root);
+            snprintf(dac->usb_uevent_path, sizeof(dac->usb_uevent_path), "%s", uevent_path);
+            snprintf(dac->usb_devnode_path, sizeof(dac->usb_devnode_path), "%s", devnode_path);
+            dac->iface_count = scanned_count;
+            memcpy(dac->ifaces, scanned_ifaces, sizeof(scanned_ifaces));
+
+            if (dac->uaudio_qmi_dev[0] == '\0') {
+                struct utsname uts;
+                unsigned int k_maj = 0, k_min = 0;
+                if (uname(&uts) == 0 &&
+                    sscanf(uts.release, "%u.%u", &k_maj, &k_min) == 2 &&
+                    (k_maj > 5 || (k_maj == 5 && k_min >= 15))) {
+                    DIR *d_qmi = opendir("/sys/bus/platform/drivers/uaudio-qmi");
+                    if (d_qmi) {
+                        struct dirent *ent;
+                        while ((ent = readdir(d_qmi)) != NULL) {
+                            if (ent->d_name[0] == '.')
+                                continue;
+                            if (strcmp(ent->d_name, "bind") == 0 ||
+                                strcmp(ent->d_name, "unbind") == 0 ||
+                                strcmp(ent->d_name, "uevent") == 0 ||
+                                strcmp(ent->d_name, "module") == 0)
+                                continue;
+                            if (strstr(ent->d_name, "usb_audio_qmi") != NULL ||
+                                strstr(ent->d_name, "uaudio") != NULL) {
+                                snprintf(dac->uaudio_qmi_dev, sizeof(dac->uaudio_qmi_dev), "%s", ent->d_name);
+                                break;
+                            }
+                        }
+                        closedir(d_qmi);
+                    }
+                }
+            }
+        }
+    }
+
+    if (dac->iface_count <= 0 || dac->card != cmd->card ||
+        dac->usb_uevent_path[0] == '\0' || !file_exists(dac->usb_uevent_path))
+        return;
+
+    if (is_claimed_by_usbfs(dac->usb_id))
+        return;
+
+    snprintf(cmd->usb_uevent_path, sizeof(cmd->usb_uevent_path), "%s", dac->usb_uevent_path);
+
+    const char *unbind_path     = "/sys/bus/usb/drivers/snd-usb-audio/unbind";
+    const char *bind_path       = "/sys/bus/usb/drivers/snd-usb-audio/bind";
+    const char *qmi_unbind_path = "/sys/bus/platform/drivers/uaudio-qmi/unbind";
+    const char *qmi_bind_path   = "/sys/bus/platform/drivers/uaudio-qmi/bind";
+
+    /* Mark claimed before unbinding so supervisor tplayd will run crash-recovery
+       rebind + "add" uevent even if the child is killed during unbind/remove/bind. */
+    atomic_store_explicit(&dac->dac_claimed, true, memory_order_release);
+    cmd->dac_claimed = true;
+
+    /* Step 2: Synchronous kernel unbind.
+       In the kernel, usb_audio_disconnect synchronously runs uaudio_disconnect_cb /
+       qc_usb_audio_offload_disconnect (stopping any active card0 QMI/DSP offload)
+       and snd_card_disconnect (severing any active cardN PCM streams with -ENODEV). */
+    for (int i = 0; i < dac->iface_count; i++) {
+        sys_write_opt(unbind_path, dac->ifaces[i]);
+    }
+
+    /* Step 3: Wait for ALSA card teardown before emitting synthetic USB "remove" uevent.
+       Ensures /proc/asound/cardN is gone and system_server's FileObserver on /dev/snd
+       processes IN_DELETE (mAlsaCards.remove(card)) before UsbAlsaManager.usbDeviceRemoved runs. */
+    char pcm_dev_path[128];
+    char ctl_dev_path[128];
+    char proc_card_path[128];
+    snprintf(pcm_dev_path, sizeof(pcm_dev_path), "/dev/snd/pcmC%uD%up", cmd->card, cmd->device);
+    snprintf(ctl_dev_path, sizeof(ctl_dev_path), "/dev/snd/controlC%u", cmd->card);
+    snprintf(proc_card_path, sizeof(proc_card_path), "/proc/asound/card%u", cmd->card);
+
+    for (int wait_ms = 0; wait_ms < 100; wait_ms++) {
+        if (access(pcm_dev_path, F_OK) != 0 &&
+            access(ctl_dev_path, F_OK) != 0 &&
+            access(proc_card_path, F_OK) != 0)
+            break;
+        usleep(1000);
+    }
+    usleep(8000);
+
+    /* Step 4: Emit synthetic "remove" uevent on USB device root and wait for
+       /dev/bus/usb/BBB/DDD unlink + UsbAlsaManager.usbDeviceRemoved (0 ms path). */
+    sys_write_opt(dac->usb_uevent_path, "remove");
+
+    if (dac->usb_devnode_path[0] != '\0') {
+        for (int wait_ms = 0; wait_ms < 100; wait_ms++) {
+            if (access(dac->usb_devnode_path, F_OK) != 0)
+                break;
+            usleep(1000);
+        }
+    }
+    usleep(12000);
+
+    /* Step 5: Bracket snd-usb-audio bind with uaudio-qmi unbind/bind (if present)
+       so usb_audio_probe sees platform_ops == NULL and leaves uadev[card].chip == NULL
+       while tinyplay plays (preventing ADSP QMI offload hijacks during BECOMING_NOISY),
+       then immediately restore uaudio-qmi platform_ops.
+       usb_audio_probe on :1.0 auto-claims sibling streaming interfaces via
+       usb_driver_claim_interface; EBUSY/ENODEV on :1.1+ writes is expected and ignored.
+       Wait for both pcmC%uD%up and controlC%u (registered last in snd_device_register_all,
+       opened first by alsa-lib snd_pcm_hw_open). */
+    if (dac->uaudio_qmi_dev[0] != '\0') {
+        sys_write_opt(qmi_unbind_path, dac->uaudio_qmi_dev);
+    }
+    for (int i = 0; i < dac->iface_count; i++) {
+        sys_write_opt(bind_path, dac->ifaces[i]);
+    }
+    if (dac->uaudio_qmi_dev[0] != '\0') {
+        sys_write_opt(qmi_bind_path, dac->uaudio_qmi_dev);
+    }
+
+    for (int wait_ms = 0; wait_ms < 500; wait_ms++) {
+        if (access(pcm_dev_path, R_OK | W_OK) == 0 &&
+            access(ctl_dev_path, R_OK | W_OK) == 0)
+            break;
+        usleep(1000);
+    }
+}
+
+static ATTR_COLD void
+release_usb_dac(struct cmd *cmd)
+{
+    if (!cmd || !cmd->use_unbind)
+        return;
+
+    struct usb_dac_shm *dac = (g_dac_shm && g_dac_shm != MAP_FAILED) ? g_dac_shm : &g_dac_shm_fallback;
+    bool was_claimed = atomic_exchange_explicit(&dac->dac_claimed, false, memory_order_acq_rel);
+    cmd->dac_claimed = false;
+    if (!was_claimed)
+        return;
+
+    const char *uevent_path = (dac->usb_uevent_path[0] != '\0') ? dac->usb_uevent_path : cmd->usb_uevent_path;
+    if (uevent_path[0] == '\0')
+        return;
+
+    unsigned int card = (dac->iface_count > 0) ? dac->card : cmd->card;
+    unsigned int device = (dac->iface_count > 0) ? dac->device : cmd->device;
+    char pcm_dev_path[128];
+    char ctl_dev_path[128];
+    char proc_card_path[128];
+    snprintf(pcm_dev_path, sizeof(pcm_dev_path), "/dev/snd/pcmC%uD%up", card, device);
+    snprintf(ctl_dev_path, sizeof(ctl_dev_path), "/dev/snd/controlC%u", card);
+    snprintf(proc_card_path, sizeof(proc_card_path), "/proc/asound/card%u", card);
+
+    const char *unbind_path   = "/sys/bus/usb/drivers/snd-usb-audio/unbind";
+    const char *bind_path     = "/sys/bus/usb/drivers/snd-usb-audio/bind";
+    const char *qmi_bind_path = "/sys/bus/platform/drivers/uaudio-qmi/bind";
+
+    /* Step R1: Crash-recovery safeguard in case child was SIGKILLed between
+       uaudio-qmi unbind and bind in Step 5 (harmless -EBUSY if already bound). */
+    if (dac->uaudio_qmi_dev[0] != '\0') {
+        sys_write_opt(qmi_bind_path, dac->uaudio_qmi_dev);
+    }
+
+    /* If the USB DAC was physically unplugged, its sysfs directory is already gone
+       and the kernel has already torn down the ALSA card and USB device nodes. */
+    if (!file_exists(uevent_path))
+        return;
+
+    /* Step R2: If uaudio-qmi bracketing was used in Step 5, uadev[card].chip is NULL.
+       Unbind snd-usb-audio while /dev/bus/usb/BBB/DDD is still unlinked so that Step R3
+       re-runs usb_audio_probe -> uaudio_connect(chip) with uaudio-qmi bound. */
+    if (dac->uaudio_qmi_dev[0] != '\0' && dac->iface_count > 0) {
+        for (int i = 0; i < dac->iface_count; i++) {
+            sys_write_opt(unbind_path, dac->ifaces[i]);
+        }
+        for (int wait_ms = 0; wait_ms < 100; wait_ms++) {
+            if (access(pcm_dev_path, F_OK) != 0 &&
+                access(ctl_dev_path, F_OK) != 0 &&
+                access(proc_card_path, F_OK) != 0)
+                break;
+            usleep(1000);
+        }
+    }
+
+    /* Step R3: Ensure snd-usb-audio interfaces are bound (restoring uadev[card].chip
+       and uadev[card].sb via uaudio_connect, or recovering from mid-acquire crash)
+       and wait for /dev/snd nodes + FileObserver settle before "add" uevent. */
+    if ((dac->uaudio_qmi_dev[0] != '\0' ||
+         access(pcm_dev_path, F_OK) != 0 ||
+         access(ctl_dev_path, F_OK) != 0) && dac->iface_count > 0) {
+        for (int i = 0; i < dac->iface_count; i++) {
+            sys_write_opt(bind_path, dac->ifaces[i]);
+        }
+        for (int wait_ms = 0; wait_ms < 250; wait_ms++) {
+            if (access(pcm_dev_path, R_OK | W_OK) == 0 &&
+                access(ctl_dev_path, R_OK | W_OK) == 0)
+                break;
+            usleep(1000);
+        }
+        if (dac->uaudio_qmi_dev[0] != '\0') {
+            usleep(8000);
+        }
+    }
+
+    /* Step R4: Emit synthetic "add" uevent so ueventd recreates /dev/bus/usb/BBB/DDD and
+       UsbHostManager -> UsbAlsaManager.usbDeviceAdded() restores Android routing.
+       Wait 20 ms after node creation so UsbService host thread completes EP0 descriptor
+       reads and waitForAlsaDevice(card, true) before any rapid re-acquire. */
+    sys_write_opt(uevent_path, "add");
+
+    if (dac->usb_devnode_path[0] != '\0') {
+        for (int wait_ms = 0; wait_ms < 100; wait_ms++) {
+            if (access(dac->usb_devnode_path, F_OK) == 0)
+                break;
+            usleep(1000);
+        }
+    }
+    usleep(20000);
 }
 
 /* =========================================================================
@@ -3327,8 +3631,8 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
                             fade_is_exit = false;
                             sm_state = SM_FADING_OUT_INIT;
                         } else {
+                            release_usb_dac(cmd);
                             if (sys_isolated) {
-                                release_usb_dac(cmd);
                                 fast_revert_system_state(true, false);
                                 reset_process_priority();
                                 sys_isolated = false;
@@ -3973,8 +4277,8 @@ play_sample(struct ctx *__restrict__ ctx, struct cmd *__restrict__ cmd)
             bool cold_reopen = false;
             if (!ctx->pcm) {
                 cold_reopen = true;
+                acquire_usb_dac(cmd);
                 if (!sys_isolated) {
-                    acquire_usb_dac(cmd);
                     fast_apply_system_state();
                     optimize_process(cmd->cpu_core);
                     sys_isolated = true;
@@ -4510,6 +4814,16 @@ main(int argc, char **argv)
     if (!cmd.filename) {
         print_usage(argv[0]);
         return 1;
+    }
+
+    /* Allocate shared USB DAC state across fork() so child pause/resume and
+       supervisor crash-recovery stay strictly synchronized without resizing player_ctrl. */
+    void *dac_shm_map = mmap(NULL, sizeof(struct usb_dac_shm),
+                             PROT_READ | PROT_WRITE,
+                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (dac_shm_map != MAP_FAILED) {
+        g_dac_shm = (struct usb_dac_shm *)dac_shm_map;
+        atomic_init(&g_dac_shm->dac_claimed, false);
     }
 
     /* Acquire USB DAC */
